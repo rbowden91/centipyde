@@ -1,0 +1,6 @@
+[submodule "clib/libcs50"]
+	path = clib/libcs50
+	url = https://github.com/cs50/libcs50.git
+[submodule "clib/musl"]
+	path = clib/musl
+	url = git://git.musl-libc.org/musl
