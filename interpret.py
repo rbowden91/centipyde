@@ -6,6 +6,9 @@ import operator
 from contextlib import contextmanager
 from pycparser import c_generator, c_ast, c_lexer, c_parser, preprocess_file
 
+from inspect import signature
+
+
 import c_utils
 
 # TODO: check results for overflow???
@@ -100,20 +103,40 @@ def cast_to_python_val(type_, val):
         return val
     assert False, type_
 
-def expand_type(type_, typedefs):
-    ret = []
+def expand_type(type_, typedefs, continuation = None):
+    is_continuation = continuation is not None
+    if continuation is not None:
+        continuation = make_cont(continuation)
+        continuation.wrap(lambda ret: ret)
+    else:
+        continuation = make_cont(lambda ret: ret)
 
-    assert isinstance(type_, list)
-    for t in type_:
-        if isinstance(t, tuple):
-            # this must be a function type
-            ret.append((t[0], expand_type(t[1], typedefs), t[2], [expand_type(ptype, typedefs) for ptype in t[3]]))
-        elif t in typedefs:
-            ret.extend(typedefs[t])
-        else:
-            assert t in python_type_map or t.startswith('[') or t == '*' or t == '...'
-            ret.append(t)
-    return ret
+    if is_func_type(type_):
+        continuation.wrap(lambda ret_type: lambda ptypes: (type_[0], ret_type, type_[2], ptypes))
+        for j in range(len(type_[3])-1,-1,-1):
+            ptype = type_[3][j]
+            continuation.wrap(
+                lambda ret_type: lambda ptypes: expand_type(ptype, typedefs,
+                lambda ptype: ret_type, ptypes + [ptype]))
+            continuation.wrap(lambda _: expand_type(type_[1], typedefs, lambda ret_type: (ret_type, [])))
+    elif isinstance(type_, list):
+        for i in range(len(type_)-1, -1, -1):
+            continuation.wrap((
+                lambda t:
+                lambda ret: expand_type(t, typedefs,
+                lambda t: ret + [t]))(type_[i]))
+        continuation.wrap(lambda _: [])
+    elif type_ in typedefs:
+        continuation.wrap(lambda _: typedefs[type_])
+    else:
+        continuation.wrap(
+            lambda _: my_assert(type_ in python_type_map or type_.startswith('[') or type_ == '*' or type_ == '...',
+                                'Invalid type',
+            lambda _: type_))
+    if not is_continuation:
+        return continuation.func(None)
+    else:
+        return Info(('expand_type'), continuation)
 
 # TODO: this isn't nearly completely enough. for example, upcast int to long long
 def implicit_cast(type1, val1, type2, val2):
@@ -130,7 +153,8 @@ def implicit_cast(type1, val1, type2, val2):
     return type1, val1, val2
 
 def is_func_type(type_):
-    return type_[0] == '()'
+    #return type_[0].startswith('(')
+    return isinstance(type_, tuple)
 
 def is_float_type(type_):
     return len(type_) == 1 and type_[0] in float_types
@@ -144,12 +168,117 @@ def is_pointer_type(type_):
 def is_string_type(type_):
     return len(type_) == 2 and is_pointer_type(type_[0]) and type_[1] == 'char'
 
+def types_match(type1, type2):
+    return type1 == type2
+
+def is_valid_return_value(functype, val):
+    return types_match(functype[0][1], val.type)
+
+def is_void_function(type_):
+    return type_[0][1] == 'void'
+
+
+def make_cont(func):
+    if isinstance(func, Continuation):
+        return func
+    else:
+        return Continuation(func)
+
+def my_assert(condition, string, continuation):
+    assert condition, string
+    continuation(None)
 
 
 # TODO: cache results from particularly common subtrees?
 # TODO: asserts shouldn't really be asserts, since then broken student code will crash this code
 # TODO: handle sizeof
-class Interpreter(c_ast.NodeVisitor):
+# can't inherit from genericvisitor, since we need to pass continuations everywhere
+
+class Info(object):
+    __slots__ = ['args', 'continuation']
+
+    def __init__(self, args, continuation):
+        self.args = args
+        assert isinstance(continuation, Continuation)
+        self.continuation = continuation
+
+    def __str__(self):
+        return 'Info(' + str(self.args) + ', ' + str(self.continuation) + ')'
+
+class Continuation(object):
+    __slots__ = ['func']
+    def __init__(self, func):
+        assert callable(func)
+        assert len(signature(func).parameters) == 1
+        self.func = func
+
+    def cprint(self, val):
+        old_func = self.func
+        def inner(k):
+            print(val)
+            old_func(k)
+        self.func = inner
+        return self
+
+    # order is index, arg, k
+    def loop(self, args, passthrough=False, index=False, k=None):
+        assert k is not None
+        for i in range(len(args)-1,-1,-1):
+            func = k
+            if index:
+                func = func(i)
+            func = func(args[i])
+            if passthrough:
+                self.func = func(self.func)
+                if isinstance(self.func, Info):
+                    self.func = (lambda k: lambda _: k)(self.func)
+            else:
+                if isinstance(func, Info):
+                    func = (lambda k: lambda _: k)(func)
+                self.wrap(func)
+        assert callable(self.func)
+        return self
+
+    def passthrough(self, func):
+        assert callable(func)
+        assert len(signature(func).parameters) == 1
+        self.func = func(self.func)
+        if isinstance(self.func, Info):
+            self.func = (lambda k: lambda _: k)(self.func)
+        assert callable(self.func)
+        return self
+
+    def wrap(self, k):
+        if isinstance(k, Info):
+            k = (lambda k: lambda _: k)(k)
+        assert callable(k)
+        assert len(signature(k).parameters) == 1
+        old_func = self.func
+        def new_func(args):
+            func = k
+            if isinstance(args, tuple):
+                for arg in args:
+                    func = func(arg)
+                return old_func(func)
+            else:
+                return old_func(func(args))
+        self.func = new_func
+        assert callable(self.func)
+        return self
+
+class Address(object):
+    __slots__ = ['base', 'offset']
+    def __init__(self, base, offset):
+        self.base = base
+        self.offset = offset
+
+class Val(object):
+    __slots__ = ['type', 'value']
+    def __init__(self, type_, value):
+        self.type = type_
+        self.value = value
+
+class Interpreter(object):
     def __init__(self, require_decls=True):
         self.require_decls = require_decls
 
@@ -158,12 +287,10 @@ class Interpreter(c_ast.NodeVisitor):
         self.stderr = ''
         self.filesystem = {}
 
-        self.id_map = [{}]
-        self.type_map = [{}]
+        self.global_map = {}
 
         # values are tuples of type, num_elements, and array of elements
         self.memory = {}
-        self.contexts = [None]
         self.string_constants = {}
 
         # TODO: remove this hard-coding
@@ -172,46 +299,72 @@ class Interpreter(c_ast.NodeVisitor):
         for name in builtin_funcs:
             type_, func = builtin_funcs[name](self)
             type_ = expand_type(type_, self.typedefs)
-            self.id_map[0][name] = (type_, name)
-            self.memory_init(name, type_, 1, [func], 'text')
+            self.global_map[name] = Val(type_, name)
+            self.memory_init(name, type_, 1, [(lambda func: lambda args, k: k(func(args)))(func)], 'text')
 
         self.memory_init('NULL', 'void', 0, [], 'NULL')
 
-    @contextmanager
-    def scope(self):
-        self.id_map.append({})
-        self.type_map.append({})
-        try:
-            yield
-        except:
-            raise
-        else:
-            self.id_map.pop()
-            self.type_map.pop()
+    def extend_scope(self, scope, continuation):
+        continuation = make_cont(continuation)
+        continuation.wrap(scope + [{}])
+        return Info('extend_scope', continuation)
 
-    @contextmanager
-    def context(self, context):
-        self.contexts.append(context)
-        try:
-            yield
-        except:
-            raise
-        else:
-            self.contexts.pop()
+    def update_scope(self, scope, id_=None, val=None, context=None, continuation=None):
+        assert continuation is not None
+        assert context is not None or id_ is not None
 
-    def memory_init(self, name, type_, len_, array, segment):
+        if context is not None:
+            scope = scope.copy()
+            scope[1] = context
+        if id_ is not None:
+            scope[0][-1][id_] = val
+
+        # TODO: use "self.wrap" or something instead, which automatically calls make_cont?
+        continuation = make_cont(continuation)
+        continuation.wrap(lambda _: scope)
+        return Info((id_, val, context), continuation)
+
+    def memory_init(self, name, type_, len_, base, segment, continuation = None):
         self.memory[name] = {
             'type': type_,
             'name': name,
             'len': len_,
-            'array': array,
+            'base': base,
             'segment': segment
         }
+        if continuation:
+            continuation = make_cont(continuation)
+            continuation.wrap(lambda _: self.memory[name])
+            return Info(('memory', name, self.memory[name]), continuation)
+
+    def update_memory(self, arr, val, continuation):
+        continuation = make_cont(continuation)
+        continuation.func(sef.memory[arr])
+        return (name, self.memory), None, lambda _: continuation
+
+    def handle_string_const(self, type_, scope, continuation):
+        # TODO: check how it's being declared, since we might be doing a mutable character array
+        continuation.wrap(lambda name: Address(name, 0))
+
+        if n.value in self.string_constants:
+            name = self.string_constants[n.value]
+            continuation.wrap(lambda _: name)
+        else:
+            const_num = len(self.string_constants)
+            # should be unique in memory, since it has a space in the name
+            name = 'strconst ' + str(const_num)
+            self.string_constants[n.value] = name
+            # append 0 for the \0 character
+            array = bytes(n.value, 'latin-1') + bytes([0])
+            continuation.wrap(self.memory_init(name, type_, len(array), array, 'rodata', lambda _: name))
+        return Info(('strconst'), continuation)
 
     # executes a program from the main function
     # shouldn't call this multiple times, since memory might be screwed up (global values not reinitialized, etc.)
     # TODO: _start??
-    def execute(self, argv, stdin=''):
+    def setup_main(self, argv, stdin, continuation):
+        continuation = make_cont(continuation)
+
         # TODO: need to reset global variables to initial values as well
         for i in list(self.memory.keys()):
             if self.memory[i]['segment'] in ['heap', 'stack', 'argv']:
@@ -219,11 +372,13 @@ class Interpreter(c_ast.NodeVisitor):
 
         # TODO: validate argv
 
-        self.id_map[-1]['argc'] = ('int', len(argv) + 1)
+        id_map = {}
+
+        id_map['argc'] = ('int', len(argv) + 1)
 
         # this is the name of the spot in self.memory
         # the second index is where in the array this id references
-        self.id_map[-1]['argv'] = (['*', '*', 'char'], ('argv', 0))
+        id_map['argv'] = (['*', '*', 'char'], ('argv', 0))
 
         # TODO: environment variables as well?
         self.memory_init('argv', ['*', 'char'], len(argv) + 1,
@@ -241,145 +396,164 @@ class Interpreter(c_ast.NodeVisitor):
         self.stdin = stdin
 
         # call the body of the main function
-        exitcode = self.visit(self.memory['main']['array'][0])
-        return exitcode
+        continuation.wrap(lambda flow: \
+            'Exiting with default code 0' if flow is None \
+            else 'Exiting with code ' + str(flow.value))
 
+        return self.visit(self.memory['main']['base'][0], ([self.global_map, id_map], 'funcbody'), continuation)
 
-    def visit_ArrayRef(self, n):
-        # TODO: technically can flip order of these things?
-        # TODO: nested array refs?? argv[1][2]
-        with self.context('array_ref'):
-            idx_type, idx = self.visit(n.subscript)
-            arr_type, arr = self.visit(n.name)
+    def visit(self, node, scope, continuation):
+        method = 'visit_' + node.__class__.__name__
+        if not isinstance(continuation, Continuation):
+            continuation = Continuation(continuation)
+        func = getattr(self, method)
+        assert func is not None, "Unimplemented Node Type!"
+        ret = func(node, scope, continuation)
+        assert isinstance(ret, Info)
+        return ret
 
-        # exactly one of idx and arr must be a pointer type
-        assert is_pointer_type(idx_type) != is_pointer_type(arr_type)
-
-        # swap the two, in case the student happened to do something like 2[argv], which is technically valid
-        if is_pointer_type(idx_type):
-            idx_type, idx, arr_type, arr = arr_type, arr, idx_type, idx
-        arr, offset = arr
-        idx += offset
-
-        assert idx < self.memory[arr]['len'], 'Out of bounds array:{} idx:{} length:{}'.format(arr, idx,
-                self.memory[arr]['len'])
-
+    def visit_ArrayRef(self, n, scope, continuation):
         # TODO: shouldn't be allowed to assign to symbols / consts? Actually, symbols would fall under visit_ID
-        if self.contexts[-1] == 'assignment_lvalue':
-            assert self.memory[arr]['segment'] not in ['rodata', 'text', 'NULL'], self.memory[arr]['segment']
-            return lambda val: operator.setitem(self.memory[arr]['array'], idx, val)
+        # TODO: nested array refs?? argv[1][2]. need to handle dims appropriately
+
+        if scope[1] == 'lvalue':
+            continuation.wrap(lambda arr: lambda idx: \
+                my_assert(self.memory[arr]['segment'] not in ['rodata', 'text', 'NULL'], self.memory[arr]['segment'],
+                lambda _: (lambda val: operator.setitem(self.memory[arr]['base'], idx+arr.offset, val))))
         else:
-            return self.memory[arr]['type'], self.memory[arr]['array'][idx]
-
-    # TODO: pointer deref?
-    def visit_Assignment(self, n):
-        with self.context('assignment_lvalue'):
-            assignment_op = self.visit(n.lvalue)
-
-        if n.op != '=':
-            op = node.op[-1]
-            node = c_ast.BinaryOp(op, n.lvalue, n.rvalue)
-        else:
-            node = n.rvalue
-        with self.context('assignment_rvalue'):
-            # TODO: validate type!
-            type_, val = self.visit(n.rvalue)
-            assignment_op(val)
-        return None, None
-
-    def visit_Cast(self, n):
-        # TODO: validate this?
-        type_ = self.visit(n.to_type)
-        old_type, val = self.visit(n.expr)
-        return type_, val
+            continuation.wrap(
+                lambda arr: lambda idx: Val(self.memory[arr]['type'], self.memory[arr]['base'][idx+arr.offset]))
 
 
-    def visit_BinaryOp(self, n):
+        continuation.wrap(lambda arr: lambda idx: \
+            my_assert(idx + arr.offset < self.memory[arr]['len'],
+                'Out of bounds array:{} idx:{} length:{}'.format(arr, idx, self.memory[arr]['len']),
+                lambda _: arr, idx))
+
+        continuation.wrap(
+            self.visit(n.name, scope,
+            lambda arr: self.visit(n.subscript, scope,
+            # swap the two, in case the student happened to do something like 2[argv], which is
+            # technically valid
+            lambda idx: my_assert(is_pointer_type(idx_type) != is_pointer_type(arr_type),
+                        "Only one can be an address",
+            lambda _: (idx, arr) if is_pointer_type(idx) else (arr, idx)))))
+
+        return Info(n, continuation)
+
+
+    def visit_Assignment(self, n, scope, continuation):
+        # TODO: handle others
+        assert n.op == '='
+
+        continuation.passthrough(lambda k:
+            self.update_scope(scope, context='lvalue', continuation=
+            lambda scope: self.visit(n.lvalue, scope,
+            lambda assignment_op: self.update_scope(scope, context='rvalue', continuation=
+            lambda scope: self.visit(n.rvalue, scope,
+            # TODO:validate types
+            lambda val: assignment_op(val, k))))))
+
+        return Info(n, continuation)
+
+    def visit_Cast(self, n, scope, continuation):
+        continuation.wrap(
+            self.visit(n.expr, scope,
+            lambda val: self.visit(n.to_type, scope,
+            # TODO: validate
+            lambda type_: Val(type_, val.value))))
+        return Info(n, continuation)
+
+
+    def visit_BinaryOp(self, n, scope, continuation):
         assert n.op in binops
 
-        ltype, lval = self.visit(n.left)
-
-        # && and || are special, because they can short circuit
-        if n.op == '&&' and not lval:
-            return ['int'], 0
-        elif n.op == '||' and lval:
-            return ['int'], 1
-
-        rtype, rval = self.visit(n.right)
-
-        # TODO: only currently supported pointer math is between a pointer for addition and subtraction, and two pointers for subtraction. Could use like, xor support or something?
-
-        add_back = None
-        if is_pointer_type(ltype) or is_pointer_type(rtype):
-            if n.op == '==' or n.op == '!=':
-                # specifically for NULL handling
-                if not is_pointer_type(ltype) or not is_pointer_type(rtype):
-                    type_, lval, rval = implicit_cast(ltype, lval, rtype, rval)
-                    rtype = ltype = type_
-
-            if is_pointer_type(ltype) and is_pointer_type(rtype):
-                assert n.op in ['-', '!=', '<', '>', '<=', '>=', '==']
-                if n.op == '-':
-                    (larr, lval), (rarr, rval), type_ = lval, rval, ltype
-                    assert larr == rarr
-                else: assert ltype == rtype
-            else:
-                assert n.op in ['+', '-']
-                if is_pointer_type(ltype):
-                    (add_back, lval), type_ = lval, ltype
-                else:
-                    (add_back, rval), type_ = rval, rtype
-
-        else:
-            type_, lval, rval = implicit_cast(ltype, lval, rtype, rval)
-
-        if n.op == '%':
-            assert is_int_type(type_), type_
-            assert rval != 0
-        if n.op == '/':
-            assert rval != 0
-
-        type_, op = binops[n.op](type_)
         # TODO cast to c type nonsense
-        val = op(lval, rval)
-        if add_back is not None:
-            val = (add_back, val)
-        return type_, val
+        continuation.wrap(
+            lambda lval: lambda rval: my_assert(n.op != '%' or is_int_type(lval.type), lval.type,
+            lambda _: my_assert(n.op != '%' or rval != 0, "Can't mod by zero",
+            lambda _: my_assert(n.op != '/' or rval != 0, "Can't divide by zero",
+            lambda _: Val(lval.type, binops[n.op](lval.type)(lval.value, rval.value))))))
+
+        continuation.wrap(
+            self.visit(n.left, scope,
+            # && and || are special, because they can short circuit
+            lambda lval: Val(['_Bool'], 0) if n.op == '&&' and not lval \
+                         else Val(['_Bool'], 1) if n.op == '||' and lval \
+                         else self.visit(n.right, scope,
+                         lambda rval: implicit_cast(lval, rval))))
+
+        # TODO: only currently supported pointer math is between a pointer for addition and subtraction,
+        # and two pointers for subtraction. Could use like, xor support or something?
+
+        #add_back = None
+        #if is_pointer_type(ltype) or is_pointer_type(rtype):
+        #    if n.op == '==' or n.op == '!=':
+        #        # specifically for NULL handling
+        #        if not is_pointer_type(ltype) or not is_pointer_type(rtype):
+        #            type_, lval, rval = implicit_cast(ltype, lval, rtype, rval)
+        #            rtype = ltype = type_
+
+        #    if is_pointer_type(ltype) and is_pointer_type(rtype):
+        #        assert n.op in ['-', '!=', '<', '>', '<=', '>=', '==']
+        #        if n.op == '-':
+        #            (larr, lval), (rarr, rval), type_ = lval, rval, ltype
+        #            assert larr == rarr
+        #        else: assert ltype == rtype
+        #    else:
+        #        assert n.op in ['+', '-']
+        #        if is_pointer_type(ltype):
+        #            (add_back, lval), type_ = lval, ltype
+        #        else:
+        #            (add_back, rval), type_ = rval, rtype
+
+        #else:
 
 
-    def visit_Break(self, n):
-        return 'break', None
+        #val = op(lval, rval)
+        #if add_back is not None:
+        #    val = (add_back, val)
+        #return type_, val
+        return Info(n, continuation)
 
-    def visit_Compound(self, n):
-        with self.scope():
-            if n.block_items:
-                for stmt in n.block_items:
-                    with self.context('stmt'):
-                        ret, retval = self.visit(stmt)
-                    if ret is not None:
-                        return ret, retval
-        return None, None
 
-    def visit_Constant(self, n):
+    def visit_Break(self, n, scope, continuation):
+        #assert continuation['break'] is not None, 'Break in of invalid context'
+        continuation.wrap(lambda _: Val('Break', None))
+        return Info(n, continuation)
+
+    def visit_Compound(self, n, scope, continuation):
+
+        continuation.wrap(
+            lambda flow: Val('Normal', None) if flow is None \
+            else flow)
+
+        if n.block_items:
+            continuation.loop(n.block_items, passthrough=True, k=
+                lambda stmt: lambda k:
+                lambda flow: self.visit(stmt, scope, k) if flow is None \
+                             else k(flow))
+        continuation.wrap(lambda _: None)
+
+        # TODO: make sure that 'Normal', etc. isn't defined as an actual type
+        # TODO: do we actually ever even care to stop on this node?
+        return Info(n, continuation)
+
+    def visit_Constant(self, n, scope, continuation):
         # TODO: necessary to expand the type??
-        type_ = expand_type([n.type], self.typedefs)
-        if is_string_type(type_):
-            if n.value in self.string_constants:
-                name = self.string_constants[n.value]
-            else:
-                const_num = len(self.string_constants)
-                # should be unique in memory, since it has a space in the name
-                name = 'strconst ' + str(const_num)
-                self.string_constants[n.value] = name
-                # append 0 for the \0 character
-                array = bytes(n.value, 'latin-1') + bytes([0])
-                self.memory_init(name, type_, len(array), array, 'rodata')
-            return type_, (name, 0)
-        else:
-            return type_, cast_to_python_val(type_, n.value)
+        continuation.wrap(
+            expand_type(n.type, self.typedefs,
+            lambda type_:
+                cast_to_python_val(Val(type_, n.value)) if not is_string_type(type_) else
+                self.handle_string_const(type_, scope)))
 
-    def visit_Continue(self, n):
-        return 'continue', None
+        return Info(n, continuation)
+
+    def visit_Continue(self, n, scope, continuations):
+        #assert continuations['continue'] is not None, 'Continue in invalid context'
+        # TODO: put the loop in scope context
+        continuation.wrap(lambda _: Val('Continue', None))
+        return Info(n, continuation)
 
     # name: the variable being declared
     # quals: list of qualifiers (const, volatile)
@@ -388,165 +562,246 @@ class Interpreter(c_ast.NodeVisitor):
     # type: declaration type (probably nested with all the modifiers)
     # init: initialization value, or None
     # bitsize: bit field size, or None
-    def visit_Decl(self, n):
-        with self.context('assignment_rvalue'):
-            type_, val = self.visit(n.init) if n.init else (None, None)
-
+    def visit_Decl(self, n, scope, continuation):
         # TODO: compare n.type against type_ for validity
         # TODO: funcdecls might be declared multiple times?
-        type_ = expand_type(self.visit(n.type), self.typedefs) if n.type is not None else self.type
-        self.id_map[-1][n.name] = type_, val
+        # TODO: doesn't return the name
+        continuation.passthrough(lambda k:
+            lambda val: self.update_scope(scope, id_=n.name, val=val, continuation=k))
 
-        if self.contexts[-1] == 'stmt':
-            return None, None
+        if n.init:
+            continuation.wrap(
+                lambda type_: self.update_scope(scope, context='rvalue', continuation=self.visit(n.init, scope,
+                lambda val: Val(type_, val))))
         else:
-            # doesn't return val
-            return type_, n.name
+            continuation.wrap(lambda type_: Val(type_, None))
 
-    def visit_DeclList(self, n):
-        self.visit(n.decls[0])
-        # set this so later declarations have access to the type, like "int x = 2, y = 3;"
-        self.type = self.id_map[-1][n.decls[0].name][0]
-        [self.visit(decl) for decl in n.decls[1:]]
-        self.type = None
-        return None, None
+        if n.type:
+            continuation.passthrough(lambda k:
+                self.visit(n.type, scope,
+                lambda type_: expand_type(type_, self.typedefs, k)))
+        else: continuation.wrap(lambda type_: type_)
 
-    def visit_ExprList(self, n):
-        types = []
-        vals = []
-        for expr in n.exprs:
-            type_, val = self.visit(expr)
-            types.append(type_)
-            vals.append(val)
-        return types, vals
+        if n.type:
+            return Info(n, continuation)
+        else:
+            return lambda type_: Info(n, (lambda _: continuation.func(type_)))
 
-    def visit_ID(self, n):
-        for i in range(len(self.id_map)-1, -1, -1):
-            if n.name in self.id_map[i]:
-                id_map = self.id_map[i]
+    def visit_DeclList(self, n, scope, continuation):
+        helper = lambda i: lambda vals: lambda decl: decl(vals[0].type) if i else decl
+        # TODO: can maybe pull a bit more of this into loop
+        continuation.loop(n.decls, index=True, k=
+            lambda i: lambda decl:
+            lambda vals: helper(i, vals,
+                self.visit(decl, scope,
+                lambda val: vals + [val])))
+        continuation.wrap(lambda _: [])
+        return Info(n, continuation)
+
+    def visit_ExprList(self, n, scope, continuation):
+        continuation.loop(n.exprs, k=
+            lambda expr:
+            lambda vals: self.visit(expr, scope,
+            lambda val: vals + [val]))
+        continuation.wrap(lambda _: [])
+        return Info(n, continuation)
+
+    def visit_ID(self, n, scope, continuation):
+        for i in range(len(scope[0])-1, -1, -1):
+            if n.name in scope[0][i]:
+                id_map = scope[0][i]
                 break
         else:
-            assert not self.require_decls
+            # TODO: change to my_assert
+            assert not self.require_decls, n.name
 
-        if self.contexts[-1] == 'assignment_lvalue':
-            return lambda val: operator.setitem(id_map, n.name, val)
+        continuation.passthrough(lambda k:
+            # TODO: this is almost certainly wrong
+            ((lambda val: operator.setitem(id_map, n.name, val) or k(None)) if scope[1] == 'lvalue'
+                else lambda _: my_assert(n.name in id_map, "Undeclared identifier",
+                 lambda _: my_assert(id_map[n.name] is not None, "Uninitialized variable",
+                 lambda _: k(id_map[n.name])))))
+
+        return Info(n, continuation)
+
+    def visit_FileAST(self, n, scope, continuation):
+        # TODO: put global map placement in here??
+        # Necessary lambda _?
+        continuation.loop(n.ext, passthrough=True, k=
+            lambda ext: lambda k:
+            lambda _: self.visit(ext, scope, k))
+        return Info(n, continuation)
+
+    def visit_For(self, n, scope, continuation):
+        def for_inner(scope, continuation):
+            # TODO: scope probably has to be updated for continuations
+            continuation.passthrough(lambda k: \
+                lambda cond: self.visit(n.stmt, scope,
+                lambda flow:
+                    self.visit(n.next, scope,
+                               lambda _: for_inner(scope, k)) if flow is None or flow.type == 'Continue' \
+                    else k(None) if flow.type == 'Break' or flow.type != 'Return' \
+                    else k(flow)))
+            # TODO: is True the right default? can the condition even be empty?
+            continuation.passthrough(lambda k:
+                lambda _: self.visit(n.cond, k) if n.cond else k(Val('_Bool', True)))
+
+            return Info(n, continuation)
+
+        # TODO: can we declare a variable in both for (int i) { int i; ??
+        continuation.passthrough(lambda k: lambda scope: for_inner(n, scope, k))
+        if n.init:
+            continuation.wrap(
+                extend_scope(scope,
+                lambda scope: self.visit(n.init, scope,
+                lambda _: scope)))
         else:
-            # check use of uninitialized values
-            assert n.name in id_map and id_map[n.name] is not None
-            return id_map[n.name]
+            continuation.wrap(lambda _: scope)
+        return Info(n, continuation)
 
-    def visit_FileAST(self, n):
-        [self.visit(ext) for ext in n.ext]
 
-    def visit_For(self, n):
-        with self.scope():
-            with self.context('expr'):
-                if n.init: self.visit(n.init)
-
-            while True:
-                with self.context('expr'):
-                    ctype, cond = not n.cond or self.visit(n.cond)
-                if not cond:
-                    break
-
-                with self.context('stmt'):
-                    ret, retval = self.visit(n.stmt)
-
-                # TODO: kind of annoying that we have to propagate this all the way up the stack. Can we do better with
-                # some kind of continuation passing? Does this really even have a huge cost?
-                if ret == 'break' or ret == 'return':
-                    return ret, retval
-                with self.context('expr'):
-                    self.visit(n.next)
-        return None, None
-
-    def visit_FuncCall(self, n):
-        # TODO: check types?
-        type_, name = self.visit(n.name)
-
-        with self.context('expr'):
-            arg_types, args = self.visit(n.args) if n.args else ([], [])
-
+    def visit_FuncCall(self, n, scope, continuation):
+        # TODO: something about unused return value?
         # TODO: parse args for params / check types
-        if self.memory[name]['type'][0][0] == '(builtin)':
-            type_, val = self.memory[name]['array'][0](args)
-            # TODO: this needs to be expanded, since we might have weird types in c_utils?
-            type_ = expand_type(type_, self.typedefs)
-        elif self.memory[name]['type'][0][0] == '(user-defined)':
-            with self.context(None):
-                # TODO: need to fix scope!!
-                type_, val = self.visit(self.memory[name]['array'][0])
+        # TODO: deal with scope!!
+        #if self.memory[n.name]['type'][0][0] == '(builtin)':
+        # TODO: this needs to be expanded, since we might have weird types in c_utils?
+        continuation.wrap(
+            lambda val: expand_type(val.type, self.typedefs,
+            lambda type_: Val(type_, val.value)))
+        continuation.passthrough(lambda k:
+            lambda name: self.memory[name.value]['base'][0]([Val(['string'], "hello")], k))
+
+        #elif self.memory[name]['type'][0][0] == '(user-defined)':
+        #    # TODO: need to fix scope!!
+        #    val = self.visit(self.memory[name]['base'][0])
+        #    if flow is None:
+        #        continuation = my_assert(is_void_function(type_), "Didn't provide return value for non-void function",
+        #                continuation)
+        #    else:
+        #        continuation = my_assert(flow[0] == 'Return', "didn't return from FuncCall",
+        #                lambda _: my_assert(is_valid_return_value(type_, flow[1]), "Invalid return value", lambda _:
+        #                    continuation.func(flow[1])))
+        #else:
+        #    assert False
+
+        #if n.args:
+        #    continuation.wrap(
+        #        lambda name: self.visit(n.args, scope,
+        #        lambda args: (name, args)))
+        #else:
+        #    continuation.wrap(lambda name: (name, []))
+
+        continuation.passthrough(lambda k: self.visit(n.name, scope, k))
+
+        return Info(n, continuation)
+
+    def visit_Typedef(self, n, scope, continuation):
+        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
+        return Info(n, continuation)
+
+    def visit_TypeDecl(self, n, scope, continuation):
+        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
+        return Info(n, continuation)
+
+    def visit_ArrayDecl(self, n, scope, continuation):
+        continuation.wrap(lambda type_: lambda dim: ['[{}]'.format(dim)] + type_)
+        if n.dim:
+            continuation.wrap(lambda type_: self.visit(n.dim, scope, lambda dim: (type_, dim.value)))
         else:
-            assert False
+            continuation.wrap(lambda type_: (type_, ''))
+        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
+        return Info(n, continuation)
 
-        if self.contexts[-1] != 'stmt':
-            return type_, val
-        else:
-            # we are a statement-level function call
-            return None, None
+    def visit_IdentifierType(self, n, scope, continuation):
+        continuation.wrap(lambda _: n.names)
+        return Info(n, continuation)
 
-    def visit_TypeDecl(self, n):
-        return self.visit(n.type)
-
-    # TODO: account for dims
-    def visit_ArrayDecl(self, n):
-        # self.visit(n.dim)
-        return ['[]'] + self.visit(n.type)
-
-    def visit_IdentifierType(self, n):
-        # TODO: account for overflow in binop/unop?
-        return n.names
-
-    def visit_ParamList(self, n):
+    def visit_ParamList(self, n, scope, continuation):
         # TODO: can param.name be empty?
         if n.params:
-            return [param.name for param in n.params], [self.visit(param.type) for param in n.params]
-        else:
-            return []
+            continuation.loop(n.params, k=
+                lambda param:
+                lambda params:
+                self.visit(param.type, scope,
+                lambda ptype: (params + [(param.name, ptype)])))
+        continuation.wrap(lambda _: [])
+        return Info(n, continuation)
 
-    def visit_FuncDecl(self, n):
+    def visit_FuncDecl(self, n, scope, continuation):
         # only the funcdef funcdecl will necessarily have parameter names
-        param_names, param_types = self.visit(n.args)
-        ret_type = self.visit(n.type)
-        type_ = expand_type([('(user-defined)', ret_type, param_names, param_types)], self.typedefs)
+        # TODO: this can theoretically appear inside of funcdefs, but we would step over it
 
-        return type_
+        # TODO: typedefs should be scoped
+        #continuation.passthrough(lambda k:
+        #    lambda ret_type: lambda params:
+        #    expand_type([('(user-defined)', ret_type, params[0], params[1])], self.typedefs, k))
 
-    def visit_FuncDef(self, n):
+        #if n.args:
+        #    continuation.wrap(
+        #        lambda ret_type: self.visit(n.args, scope,
+        #        lambda param_names: lambda param_types: (ret_type, param_names, param_types)))
+        #else:
+        #    continuation.wrap(lambda ret_type: (ret_type, [], []))
+
+        #continuation.passthrough(lambda k: self.visit(n.type, scope, k))
+
+        continuation.wrap(lambda _: [('user-defined)', 'int', [], [])])
+        return Info(n, continuation)
+
+    def visit_FuncDef(self, n, scope, continuation):
         # TODO: check against prior funcdecls?
-        type_, name = self.visit(n.decl)
+        continuation.passthrough(lambda k:
+            self.visit(n.decl, scope,
+            lambda type_: self.memory_init(n.decl.name, type_, 1, [n.body], 'text', k)))
+        return Info(n, continuation)
 
-        self.memory_init(name, type_, 1, [n.body], 'text')
-        return None, None
 
-    def visit_If(self, n):
-        # XXX can the condition actually be left off?
-        if n.cond:
-            with self.context('if_cond'):
-                type_, cond = self.visit(n.cond)
-        else:
-            type_, cond = '_Bool', True
+    def visit_If(self, n, scope, continuation):
+        continuation.passthrough(lambda k:
+            lambda cond: self.visit(n.iftrue, scope, k) if cond \
+            else self.visit(n.iffalse, scope, k))
 
-        if cond:
-            return self.visit(n.iftrue)
-        elif n.iffalse:
-            return self.visit(n.iffalse)
-        else:
-            return None, None
+        continuation.passthrough(lambda k:
+            self.visit(n.cond, scope, k) if n.cond \
+            else k(Val('_Bool', True)))
 
-    def visit_Typename(self, n):
+        return Info(n, continuation)
+
+    def visit_PtrDecl(self, n, scope, continuation):
+        continuation.wrap(
+            lambda _: self.visit(n.type, scope,
+            lambda type_: ['*'] + type_))
+        return Info(n, continuation)
+
+    def visit_Struct(self, n, scope, continuation):
+        # TODO: finish this
+        if n.decls:
+            continuation.loop(n.decls, k=
+                lambda decl:
+                lambda vals: self.visit(decl, scope,
+                lambda val: (vals + [val])))
+        continuation.wrap(lambda _: [])
+
+        return Info(n, continuation)
+
+
+    def visit_Typename(self, n, scope, continuation):
         # TODO: don't know when this is not None
         # TODO: stuff with n.quals
         if n.name: assert False
-        return self.visit(n.type)
+        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
+        return Info(n, continuation)
 
+    # TODO: account for overflow in binop/unop?
     def visit_UnaryOp(self, n):
         assert n.op in unops
+        assert False
 
         # TODO: use types
         type_, val = self.visit(n.expr)
         if n.op == 'p++' or n.op == 'p--' or n.op == '++p' or n.op == '--p':
-            with self.context('assignment_lvalue'):
+            with self.context('lvalue'):
                 assignment_op = self.visit(n.expr)
             # TODO: this doesn't handle post-increment correctly
             if n.op == 'p++' or n.op == '++p':
@@ -561,45 +816,61 @@ class Interpreter(c_ast.NodeVisitor):
             # just for sizeof purposes?
             assert offset < self.memory[arr]['len']
             # TODO: dereference type_
-            return type_[1:], self.memory[arr]['array'][offset]
+            return type_[1:], self.memory[arr]['base'][offset]
         elif n.op == '&':
             assert is_pointer_type(type_)
             arr, offset = val
             # TODO: add pointer type, but only if not func pointer/constant array
-            return ['*'] + type_, self.memory[arr]['array']
+            return ['*'] + type_, self.memory[arr]['base']
         else:
             return type_, unops[n.op](type_)(val)
 
     # TODO: detect infinite loop??
-    def visit_While(self, n):
-        while True:
-            with self.context('expr'):
-                ctype, cond = not n.cond or self.visit(n.cond)
-            if not cond:
-                break
-            with self.context('stmt'):
-                ret, retval = self.visit(n.stmt)
-            if ret == 'break' or ret == 'return':
-                return ret, retval
-        return None, None
+    def visit_While(self, n, scope, continuation):
+        continuation.passthrough(lambda k:
+            lambda cond: self.visit(n.stmt, scope,
+            lambda flow: self.visit(n, scope, k) if flow is None or flow.type == 'Continue' \
+                         else k(None) if flow.type == 'Break' or flow.type != 'Return' \
+                         else k(flow)))
+        continuation.wrap(lambda _:
+            self.visit(n.cond, scope, continuation) if n.cond \
+            # TODO: is True the right default? can the condition even be empty?
+            else Val('_Bool', True))
 
-    def visit_Return(self, n):
-        type_, ret = self.visit(n.expr) if n.expr else None
-        return 'return',  ret
+        return Info(n, continuation)\
 
-if __name__=='__main__':
+    def visit_Return(self, n, scope, continuation):
+        # TODO: can we even write a return outside of a function?
+        # TODO: we need to check this elsewhere
+        #assert continuations['return'] is not None, 'Return in invalid context'
+        continuation.wrap(lambda val: Val('Return', val))
+        continuation.passthrough(lambda k: (self.visit(n.expr, scope, k) if n.expr else k(None)))
+        return Info(n, continuation)
+
+def main():
     interpret = Interpreter()
     parser = c_parser.CParser()
     try:
-        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', r'-I../fake_libc_include'])
+        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', r'-nostdinc', r'-Ifake_libc_include'])
         ast = parser.parse(cfile)
     except Exception as e:
         print('uh oh2', e)
         sys.exit(1)
 
+    def done(out):
+        print(out, interpret.stdout)
+        sys.exit(1)
+
     # some kind of JIT after the first execution?
-    interpret.visit(ast)
-    interpret.execute(['./vigenere', 'HELlO'], 'wOrld\n')
-    print(interpret.stdout)
-    interpret.execute(['./vigenere', 'HELlO'], 'wOoorld\n')
-    print(interpret.stdout)
+    k = lambda _: interpret.setup_main(['./vigenere', 'HELlO'], 'wOrld\n', Continuation(done))
+
+    info = interpret.visit(ast, [[interpret.global_map], 'global'], k)
+    while info is not None:
+        if hasattr(info.args, 'show'):
+            print(info.args.show())
+        print(info)
+        info = info.continuation.func(None)
+        assert isinstance(info, Info), info
+
+if __name__=='__main__':
+    main()

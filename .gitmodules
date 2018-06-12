@@ -4,3 +4,6 @@
 [submodule "clib/musl"]
 	path = clib/musl
 	url = git://git.musl-libc.org/musl
+[submodule "virpy"]
+	path = virpy
+	url = git@github.com:rbowden91/virpy.git
