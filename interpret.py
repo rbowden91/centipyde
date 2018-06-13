@@ -103,54 +103,18 @@ def cast_to_python_val(type_, val):
         return val
     assert False, type_
 
-def expand_type(type_, typedefs, continuation = None):
-    is_continuation = continuation is not None
-    if continuation is not None:
-        continuation = make_cont(continuation)
-        continuation.wrap(lambda ret: ret)
-    else:
-        continuation = make_cont(lambda ret: ret)
-
+def expand_type(type_, typedefs):
     if is_func_type(type_):
-        continuation.wrap(lambda ret_type: lambda ptypes: (type_[0], ret_type, type_[2], ptypes))
-        for j in range(len(type_[3])-1,-1,-1):
-            ptype = type_[3][j]
-            continuation.wrap(
-                lambda ret_type: lambda ptypes: expand_type(ptype, typedefs,
-                lambda ptype: ret_type, ptypes + [ptype]))
-            continuation.wrap(lambda _: expand_type(type_[1], typedefs, lambda ret_type: (ret_type, [])))
+        return (type_[0], expand_type(type_[1], typedefs), type_[2], expand_type(type_[3], typedefs))
     elif isinstance(type_, list):
-        for i in range(len(type_)-1, -1, -1):
-            continuation.wrap((
-                lambda t:
-                lambda ret: expand_type(t, typedefs,
-                lambda t: ret + [t]))(type_[i]))
-        continuation.wrap(lambda _: [])
+        return [expand_type(t) for t in type_]
     elif type_ in typedefs:
-        continuation.wrap(lambda _: typedefs[type_])
+        return typedefs[type_]
     else:
-        continuation.wrap(
-            lambda _: my_assert(type_ in python_type_map or type_.startswith('[') or type_ == '*' or type_ == '...',
-                                'Invalid type',
-            lambda _: type_))
-    if not is_continuation:
-        return continuation.func(None)
-    else:
-        return Info(('expand_type'), continuation)
+        # TODO: how to handle this? Could still pass a continuation, but only to help with this error?
+        my_assert(type_ in python_type_map or type_.startswith('[') or type_ == '*' or type_ == '...', 'Invalid type')
+        return type_
 
-# TODO: this isn't nearly completely enough. for example, upcast int to long long
-def implicit_cast(type1, val1, type2, val2):
-    if is_int_type(type1) and is_float_type(type2):
-        return type2, float(val1), val2
-    elif is_float_type(type1) and is_int_type(type2):
-        return type1, val1, float(val2)
-    elif is_int_type(type1) and is_pointer_type(type2):
-        assert val1 == 0
-        return type2, ('NULL', 0), val2
-    elif is_int_type(type2) and is_pointer_type(type1):
-        assert val2 == 0
-        return type1, val1, ('NULL', 0)
-    return type1, val1, val2
 
 def is_func_type(type_):
     #return type_[0].startswith('(')
@@ -207,10 +171,16 @@ class Info(object):
 
 class Continuation(object):
     __slots__ = ['func']
-    def __init__(self, func):
-        assert callable(func)
-        assert len(signature(func).parameters) == 1
-        self.func = func
+    def __init__(self):
+
+        self.continuations = []
+        self.passthroughs = []
+        self.if_id = 1
+        self.completed_if_id = set()
+
+        # No nested loops, for now
+        self.loop_passthroughs = None
+
 
     def cprint(self, val):
         old_func = self.func
@@ -220,51 +190,113 @@ class Continuation(object):
         self.func = inner
         return self
 
-    # order is index, arg, k
-    def loop(self, args, passthrough=False, index=False, k=None):
-        assert k is not None
-        for i in range(len(args)-1,-1,-1):
-            func = k
-            if index:
-                func = func(i)
-            func = func(args[i])
-            if passthrough:
-                self.func = func(self.func)
-                if isinstance(self.func, Info):
-                    self.func = (lambda k: lambda _: k)(self.func)
-            else:
-                if isinstance(func, Info):
-                    func = (lambda k: lambda _: k)(func)
-                self.wrap(func)
-        assert callable(self.func)
+    def apply(self, val):
+        # does literally nothing right now
+        #assert len(signature(func).parameters) == 0
+        #self.continuations.append(('apply', func))
         return self
 
-    def passthrough(self, func):
-        assert callable(func)
+    def handle(self, arg):
+        if arg[0] == 'apply':
+            # TODO: can we just call this in apply()
+            arg[1]()
+        elif arg[0] == 'expect':
+            arg[1](self.passthroughs.pop(0))
+        elif arg[0] == 'info':
+            return arg[1]
+        elif arg[0] == 'kassert':
+            assert arg[1](), arg[2]
+        elif arg[0] == 'loop':
+            # TODO: just move loop_var into the loop call?
+            self.passthroughs = self.loop_passthroughs + [self.passthroughs]
+        elif arg[0] == 'loop_var':
+            assert(self.continuations[-1][0] == 'loop')
+            loop = self.continuations.pop(-1)
+            loop_var = arg[1]
+            self.loop_passthroughs = self.passthroughs
+            self.passthroughs = []
+            if loop_var is None:
+                self.continuations.pop(-1)
+                self.passthroughs.append([])
+            else:
+                for i in range(len(arg[1])-1, -1, -1):
+                    loop(loop_var[i])
+                    if loop[2]:
+                        loop(self.passthroughs)
+
+        elif arg[0] == 'passthrough':
+            ret = arg[1]
+            assert ret is not None
+            self.passthroughs.append(ret)
+
+        # TODO: lots of copy-paste
+        elif arg[0] == 'if_':
+            cond = arg[1]
+            if cond:
+                self.completed_if_id.add(arg[3])
+                arg[2]()
+
+        elif arg[0] == 'elseif':
+            if arg[3] not in self.completed_if_id and arg[1]():
+                self.completed_if_id.add(arg[2])
+
+        elif arg[0] == 'else_':
+            if arg[2] not in self.completed_if_id:
+                self.completed_if_id.add(arg[2])
+                arg[1]()
+
+        self.continue_()
+
+    def expect(self, func):
         assert len(signature(func).parameters) == 1
-        self.func = func(self.func)
-        if isinstance(self.func, Info):
-            self.func = (lambda k: lambda _: k)(self.func)
-        assert callable(self.func)
+        self.continuations.append(('expect', func))
         return self
 
-    def wrap(self, k):
-        if isinstance(k, Info):
-            k = (lambda k: lambda _: k)(k)
-        assert callable(k)
-        assert len(signature(k).parameters) == 1
-        old_func = self.func
-        def new_func(args):
-            func = k
-            if isinstance(args, tuple):
-                for arg in args:
-                    func = func(arg)
-                return old_func(func)
-            else:
-                return old_func(func(args))
-        self.func = new_func
-        assert callable(self.func)
+    def info(self, info):
+        assert len(signature(func).parameters) == 1
+        self.continuations.append(('info', info))
         return self
+
+    def kassert(self, cond, str_):
+        self.continuations.append(('kassert', info))
+        return self
+
+    def loop(self, func, list_=False, shortcircuit=False):
+        assert len(signature(func).parameters) == 1
+        self.continuations.append(('loop', loop, list_, shortcircuit))
+        return self
+
+    def loop_var(self, var):
+        assert var is None or isinstance(var, list)
+        self.continuations.append(('loop_var', loop_var))
+        return self
+
+    def passthrough(self, val):
+        self.continuations.append(('passthrough', val))
+        return self
+
+    def if_(self, cond, func):
+        assert len(signature(func).parameters) == 0
+        self.continuations.append(('if_', cond, func, self.if_id))
+        self.if_id += 1
+        return self
+
+    def elseif(self, cond, func):
+        assert len(signature(func).parameters) == 0
+        self.continuations.append(('elseif', cond, func, self.if_id))
+        return self
+
+    def else_(self):
+        self.continuations.append(('else_', func, self.if_id))
+        return self
+
+    # This is just a convenience function because visiting nodes is so common
+    def visit(self, node):
+        #self.apply(lambda: self.visit(node))
+        self.apply(self.visit(node))
+        return self
+
+
 
 class Address(object):
     __slots__ = ['base', 'offset']
@@ -273,19 +305,33 @@ class Address(object):
         self.offset = offset
 
 class Val(object):
+    __slots__ = ['type', 'expanded_type', 'value']
+    def __init__(self, type_, expanded_type, value):
+        self.type = type_
+        self.value = value
+        self.expanded_type = expanded_type
+
+class Flow(object):
     __slots__ = ['type', 'value']
-    def __init__(self, type_, value):
+    def __init__(self, type_, value=None):
         self.type = type_
         self.value = value
 
 class Interpreter(object):
-    def __init__(self, require_decls=True):
+    def __init__(self, ast, require_decls=True):
         self.require_decls = require_decls
+
+        self.ast = ast
+        self.continuation = None
+        self.reverse_k = None
 
         self.stdin = None
         self.stdout = ''
         self.stderr = ''
         self.filesystem = {}
+
+        self.scope = []
+        self.context = None
 
         self.global_map = {}
 
@@ -298,57 +344,83 @@ class Interpreter(object):
 
         for name in builtin_funcs:
             type_, func = builtin_funcs[name](self)
-            type_ = expand_type(type_, self.typedefs)
-            self.global_map[name] = Val(type_, name)
-            self.memory_init(name, type_, 1, [(lambda func: lambda args, k: k(func(args)))(func)], 'text')
+            val = self.make_val(type_, name)
+            self.global_map[name] = val
+            self.memory_init(name, type_, val.expanded_type, 1, [(lambda func: lambda args, k: k(func(args)))(func)],
+                             'text')
 
-        self.memory_init('NULL', 'void', 0, [], 'NULL')
+        self.memory_init('NULL', 'void', 'void', 0, [], 'NULL')
 
-    def extend_scope(self, scope, continuation):
-        continuation = make_cont(continuation)
-        continuation.wrap(scope + [{}])
-        return Info('extend_scope', continuation)
+    def make_val(self, type_, val):
+        # TODO: associate the expanded_type with types_ instead of with vals?
+        expanded_type = expand_type(type_, self.typedefs)
+        return Val(type_, expanded_type, val)
 
-    def update_scope(self, scope, id_=None, val=None, context=None, continuation=None):
-        assert continuation is not None
-        assert context is not None or id_ is not None
+    # TODO: this isn't nearly completely enough. for example, upcast int to long long
+    def implicit_cast(val1, val2):
+        self.k.info('implicit_cast')
+        if is_int_type(val1.type) and is_float_type(val2.type):
+            val1.value=float(val1)
+            val1.type=val2.type
+        elif is_float_type(type1) and is_int_type(type2):
+            val2.value=float(val2)
+            val2.type=val1.type
+        # can only compare against NULL pointer if it's an int
+        elif is_int_type(type1) and is_pointer_type(type2):
+            self.k.myassert(lambda: val1 == 0)
+            val1.value = Address('NULL', 0)
+            val1.type = val2.type
+        elif is_int_type(type2) and is_pointer_type(type1):
+            self.k.myassert(lambda: val2 == 0)
+            val2.value = Address('NULL', 0)
+            val2.type = val1.type
+        self.k.passthrough(lambda: val1).passthrough(lambda: val2)
 
-        if context is not None:
-            scope = scope.copy()
-            scope[1] = context
-        if id_ is not None:
-            scope[0][-1][id_] = val
+    def pop_context(self):
+        self.context.pop()
+
+    def push_context(self, context):
+        self.context.push(context)
+
+    def pop_scope(self):
+        self.k.info('pop scope').apply(self.scope.pop())
+
+    def push_scope(self):
+        self.k.info('push scope').apply(self.scope.append({}))
+
+    def update_scope(self, id_, val):
+
+        scope[0][-1][id_] = val
 
         # TODO: use "self.wrap" or something instead, which automatically calls make_cont?
-        continuation = make_cont(continuation)
-        continuation.wrap(lambda _: scope)
-        return Info((id_, val, context), continuation)
+        self.k.info(('update_scope', id_, val))
 
-    def memory_init(self, name, type_, len_, base, segment, continuation = None):
+    def memory_init(self, name, type_, expanded_type, len_, base, segment):
         self.memory[name] = {
             'type': type_,
+            'expanded_type': expanded_type,
             'name': name,
             'len': len_,
             'base': base,
             'segment': segment
         }
-        if continuation:
-            continuation = make_cont(continuation)
-            continuation.wrap(lambda _: self.memory[name])
-            return Info(('memory', name, self.memory[name]), continuation)
+        (self.k
+        .info(('memory', name))
+        .passthrough(lambda: self.memory[name]))
 
-    def update_memory(self, arr, val, continuation):
-        continuation = make_cont(continuation)
-        continuation.func(sef.memory[arr])
-        return (name, self.memory), None, lambda _: continuation
+    #def update_memory(self, arr, val):
+    #    (self.k
+    #    .info((name, self.memory))
+    #    .passthrough(lambda: self.memory[arr].seti))
 
-    def handle_string_const(self, type_, scope, continuation):
+    def handle_string_const(self, type_):
         # TODO: check how it's being declared, since we might be doing a mutable character array
-        continuation.wrap(lambda name: Address(name, 0))
+        self.k.info('strconst')
+
 
         if n.value in self.string_constants:
             name = self.string_constants[n.value]
-            continuation.wrap(lambda _: name)
+            self.k.wrap(lambda _: name)
         else:
             const_num = len(self.string_constants)
             # should be unique in memory, since it has a space in the name
@@ -356,8 +428,8 @@ class Interpreter(object):
             self.string_constants[n.value] = name
             # append 0 for the \0 character
             array = bytes(n.value, 'latin-1') + bytes([0])
-            continuation.wrap(self.memory_init(name, type_, len(array), array, 'rodata', lambda _: name))
-        return Info(('strconst'), continuation)
+            self.memory_init(name, type_, len(array), array, 'rodata')
+        self.k.passthrough(Address(name, 0))
 
     # executes a program from the main function
     # shouldn't call this multiple times, since memory might be screwed up (global values not reinitialized, etc.)
@@ -397,91 +469,85 @@ class Interpreter(object):
 
         # call the body of the main function
         continuation.wrap(lambda flow: \
-            'Exiting with default code 0' if flow is None \
+            'Exiting with default code 0' if flow.type == 'Normal' \
             else 'Exiting with code ' + str(flow.value))
 
-        return self.visit(self.memory['main']['base'][0], ([self.global_map, id_map], 'funcbody'), continuation)
+        return self.k.visit(self.memory['main']['base'][0], ([self.global_map, id_map], 'funcbody'), continuation)
 
-    def visit(self, node, scope, continuation):
+    def visit(self, node):
         method = 'visit_' + node.__class__.__name__
-        if not isinstance(continuation, Continuation):
-            continuation = Continuation(continuation)
-        func = getattr(self, method)
-        assert func is not None, "Unimplemented Node Type!"
         ret = func(node, scope, continuation)
-        assert isinstance(ret, Info)
-        return ret
+        assert ret is None
 
     def visit_ArrayRef(self, n, scope, continuation):
         # TODO: shouldn't be allowed to assign to symbols / consts? Actually, symbols would fall under visit_ID
         # TODO: nested array refs?? argv[1][2]. need to handle dims appropriately
 
-        if scope[1] == 'lvalue':
-            continuation.wrap(lambda arr: lambda idx: \
-                my_assert(self.memory[arr]['segment'] not in ['rodata', 'text', 'NULL'], self.memory[arr]['segment'],
-                lambda _: (lambda val: operator.setitem(self.memory[arr]['base'], idx+arr.offset, val))))
-        else:
-            continuation.wrap(
-                lambda arr: lambda idx: Val(self.memory[arr]['type'], self.memory[arr]['base'][idx+arr.offset]))
+        (self.k.info(n)
+        .visit(n.name)
+        .visit(n.subscript)
+        .expect(lambda arr: self.k.expect(lambda idx:
+            (self.k
+            .kassert(is_pointer_type(idx.type) != is_pointer_type(arr.type), "Only one can be an address"))
+            .if_(is_pointer_type(idx), lambda: self.k.passthrough(idx).passthrough(arr))
+            .else_(lambda: self.k.passthrough(arr).passthrough(idx))))
 
+        .expect(lambda arr: self.k.expect(lambda idx:
+            (self.k
+            .kassert(idx + arr.offset < self.memory[arr]['len'],
+                'Out of bounds array:{} idx:{} length:{}'.format(arr, idx, self.memory[arr]['len']))
+            .if_(self.context[-1] == 'lvalue',
+                lambda: self.k
+                .kassert(self.memory[arr]['segment'] not in ['rodata', 'text', 'NULL'], self.memory[arr]['segment'])
+                .passthrough(lambda val: operator.setitem(self.memory[arr]['base'], idx+arr.offset, val)))
+            .else_(lambda: self.k
+                .passthrough(self.make_val(self.memory[arr]['type'], self.memory[arr]['base'][idx + arr.offset])))))))
 
-        continuation.wrap(lambda arr: lambda idx: \
-            my_assert(idx + arr.offset < self.memory[arr]['len'],
-                'Out of bounds array:{} idx:{} length:{}'.format(arr, idx, self.memory[arr]['len']),
-                lambda _: arr, idx))
-
-        continuation.wrap(
-            self.visit(n.name, scope,
-            lambda arr: self.visit(n.subscript, scope,
-            # swap the two, in case the student happened to do something like 2[argv], which is
-            # technically valid
-            lambda idx: my_assert(is_pointer_type(idx_type) != is_pointer_type(arr_type),
-                        "Only one can be an address",
-            lambda _: (idx, arr) if is_pointer_type(idx) else (arr, idx)))))
-
-        return Info(n, continuation)
-
-
-    def visit_Assignment(self, n, scope, continuation):
+    def visit_Assignment(self, n):
         # TODO: handle others
         assert n.op == '='
 
-        continuation.passthrough(lambda k:
-            self.update_scope(scope, context='lvalue', continuation=
-            lambda scope: self.visit(n.lvalue, scope,
-            lambda assignment_op: self.update_scope(scope, context='rvalue', continuation=
-            lambda scope: self.visit(n.rvalue, scope,
-            # TODO:validate types
-            lambda val: assignment_op(val, k))))))
+        (self.k.info(n)
+        .push_context('lvalue')
+        .visit(lvalue)
+        .pop_context()
+        .push_context('rvalue')
+        .visit(rvalue)
+        .pop_context()
+        .expect(lambda assignment_op: self.k.expect(lambda val:
+            # assignments return the value of the assignment
+            assignment_op(val) and self.k.passthrough(lambda: val))))
 
-        return Info(n, continuation)
-
-    def visit_Cast(self, n, scope, continuation):
-        continuation.wrap(
-            self.visit(n.expr, scope,
-            lambda val: self.visit(n.to_type, scope,
-            # TODO: validate
-            lambda type_: Val(type_, val.value))))
-        return Info(n, continuation)
+    def visit_Cast(self, n):
+        # TODO: validate
+        (self.k.info(n)
+        .visit(n.to_type)
+        .visit(n.expr)
+        .expect(lambda type_: self.k.expect(lambda val: self.k.passthrough(self.make_val(type_, val.value)))))
 
 
-    def visit_BinaryOp(self, n, scope, continuation):
+    def visit_BinaryOp(self, n):
         assert n.op in binops
 
         # TODO cast to c type nonsense
-        continuation.wrap(
-            lambda lval: lambda rval: my_assert(n.op != '%' or is_int_type(lval.type), lval.type,
-            lambda _: my_assert(n.op != '%' or rval != 0, "Can't mod by zero",
-            lambda _: my_assert(n.op != '/' or rval != 0, "Can't divide by zero",
-            lambda _: Val(lval.type, binops[n.op](lval.type)(lval.value, rval.value))))))
+        (self.k.info(n)
+        .visit(n.left)
+        .expect(lambda lval:
+            self.k
+            .if_(n.op == '&&' and not lval.value, lambda: self.k
+                .passthrough(self.make_val(['_Bool'], 0)))
+            .else_if(n.op == '||' and lval.value, lambda: self.k
+                .passthrough(self.make_val(['_Bool'], 1)))
+            .else_(lambda: self.k
+                .visit(n.right)
+                .expect(lambda rval: self.implicit_cast(lval, rval))))
+        .expect(lambda lval: self.k.expect(lambda rval:
+            self.k
+            .kassert(n.op != '%' or is_int_type(lval.type), lval.type)
+            .kassert(n.op != '%' or rval != 0, "Can't mod by zero")
+            .kassert(n.op != '/' or rval != 0, "Can't divide by zero")
+            .passthrough(lambda: self.make_val(lval.type, binops[n.op](lval.type)(lval.value, rval.value))))))
 
-        continuation.wrap(
-            self.visit(n.left, scope,
-            # && and || are special, because they can short circuit
-            lambda lval: Val(['_Bool'], 0) if n.op == '&&' and not lval \
-                         else Val(['_Bool'], 1) if n.op == '||' and lval \
-                         else self.visit(n.right, scope,
-                         lambda rval: implicit_cast(lval, rval))))
 
         # TODO: only currently supported pointer math is between a pointer for addition and subtraction,
         # and two pointers for subtraction. Could use like, xor support or something?
@@ -514,46 +580,39 @@ class Interpreter(object):
         #if add_back is not None:
         #    val = (add_back, val)
         #return type_, val
-        return Info(n, continuation)
 
 
-    def visit_Break(self, n, scope, continuation):
-        #assert continuation['break'] is not None, 'Break in of invalid context'
-        continuation.wrap(lambda _: Val('Break', None))
-        return Info(n, continuation)
+    def visit_Break(self, n):
+        #TODO assert continuation['break'] is not None, 'Break in of invalid context'
+        self.k.info(n).passthrough(Flow('Break'))
 
-    def visit_Compound(self, n, scope, continuation):
-
-        continuation.wrap(
-            lambda flow: Val('Normal', None) if flow is None \
-            else flow)
-
-        if n.block_items:
-            continuation.loop(n.block_items, passthrough=True, k=
-                lambda stmt: lambda k:
-                lambda flow: self.visit(stmt, scope, k) if flow is None \
-                             else k(flow))
-        continuation.wrap(lambda _: None)
-
-        # TODO: make sure that 'Normal', etc. isn't defined as an actual type
+    def visit_Compound(self, n):
         # TODO: do we actually ever even care to stop on this node?
-        return Info(n, continuation)
+        (self.k.info(n)
+        .loop_var(n.block_items)
+        # TODO: can't use loop, since we need to shortcut
+        .loop((lambda stmt:
+            self.k
+            .visit(stmt)
+            .expect(lambda flow:
+                self.k
+                .if_(not isinstance(flow, Flow) or flow.type != 'Normal', lambda: self.k
+                    # pass through to the looper to determine whether we should shortcircuit
+                    .passthrough(flow).passthrough(True))
+                .else_(lambda: self.k.passthrough(False)))), shortcircuit=True)
+        .expect(lambda flows: self.k.passthrough(Flow('Normal', None) if isinstance(flows[-1], Val) else flows[-1])))
 
-    def visit_Constant(self, n, scope, continuation):
+    def visit_Constant(self, n):
         # TODO: necessary to expand the type??
-        continuation.wrap(
-            expand_type(n.type, self.typedefs,
-            lambda type_:
-                cast_to_python_val(Val(type_, n.value)) if not is_string_type(type_) else
-                self.handle_string_const(type_, scope)))
+        (self.k.info(n)
+        .passthrough(lambda:
+                cast_to_python_val(self.make_val(n.type, n.value)) if not is_string_type(n.type) else
+                self.handle_string_const(n.value)))
 
-        return Info(n, continuation)
-
-    def visit_Continue(self, n, scope, continuations):
+    def visit_Continue(self, n):
         #assert continuations['continue'] is not None, 'Continue in invalid context'
         # TODO: put the loop in scope context
-        continuation.wrap(lambda _: Val('Continue', None))
-        return Info(n, continuation)
+        (self.k.info(n).passthrough(Flow('Continue')))
 
     # name: the variable being declared
     # quals: list of qualifiers (const, volatile)
@@ -562,236 +621,201 @@ class Interpreter(object):
     # type: declaration type (probably nested with all the modifiers)
     # init: initialization value, or None
     # bitsize: bit field size, or None
-    def visit_Decl(self, n, scope, continuation):
+    def visit_Decl(self, n, type_=None):
         # TODO: compare n.type against type_ for validity
         # TODO: funcdecls might be declared multiple times?
         # TODO: doesn't return the name
-        continuation.passthrough(lambda k:
-            lambda val: self.update_scope(scope, id_=n.name, val=val, continuation=k))
+        (self.k.info(n)
+        .if_(n.type, lambda: self.k.visit(n.type))
+        .else_(lambda: self.k.kassert(type_ is not None))
+        .if_(n.init, lambda: self.k
+            .apply(self.push_context('rvalue'))
+            .visit(n.init)
+            .apply(self.pop_context())
+            .expect(lambda val: self.update_scope(id_=n.name, val=val)))
+        .else_(lambda: self.k
+            # DeclList will apply the type if we need it to
+            .expect(lambda type_: self.k.passthrough(lambda: self.make_val(type_, None)))))
 
-        if n.init:
-            continuation.wrap(
-                lambda type_: self.update_scope(scope, context='rvalue', continuation=self.visit(n.init, scope,
-                lambda val: Val(type_, val))))
-        else:
-            continuation.wrap(lambda type_: Val(type_, None))
 
-        if n.type:
-            continuation.passthrough(lambda k:
-                self.visit(n.type, scope,
-                lambda type_: expand_type(type_, self.typedefs, k)))
-        else: continuation.wrap(lambda type_: type_)
+    def visit_DeclList(self, n):
+        (self.k.info(n)
+        .loop_var(lambda: n.decls)
+        .loop(lambda decl: lambda vals: self.k.visit(decl, vals[0].type if len(vals) else None), list_=True))
 
-        if n.type:
-            return Info(n, continuation)
-        else:
-            return lambda type_: Info(n, (lambda _: continuation.func(type_)))
+    def visit_ExprList(self, n):
+        (self.k.info(n)
+        .loop_var(n.exprs)
+        .loop(lambda expr: self.k.visit(expr)))
 
-    def visit_DeclList(self, n, scope, continuation):
-        helper = lambda i: lambda vals: lambda decl: decl(vals[0].type) if i else decl
-        # TODO: can maybe pull a bit more of this into loop
-        continuation.loop(n.decls, index=True, k=
-            lambda i: lambda decl:
-            lambda vals: helper(i, vals,
-                self.visit(decl, scope,
-                lambda val: vals + [val])))
-        continuation.wrap(lambda _: [])
-        return Info(n, continuation)
+    def visit_ID(self, n):
+        def helper():
+            for i in range(len(self.scope)-1, -1, -1):
+                if n.name in self.scope[i]:
+                    id_map = self.scope[i]
+                    self.k.passthrough(id_map)
+                    return
+            else:
+                self.k.kassert(not self.require_decls, n.name)
 
-    def visit_ExprList(self, n, scope, continuation):
-        continuation.loop(n.exprs, k=
-            lambda expr:
-            lambda vals: self.visit(expr, scope,
-            lambda val: vals + [val]))
-        continuation.wrap(lambda _: [])
-        return Info(n, continuation)
+        (self.k.info(n)
+        .apply(helper())
+        .expect(lambda id_map:
+            self.k
+            .if_(self.context[-1] == 'lvalue', lambda k: self.k
+                .expect(lambda val: operator.setitem(id_map, n.name, val)))
+            .else_(lambda: self.k
+                .kassert(n.name in id_map, "Undeclared identifier")
+                .kassert(id_map[n.name].value is not None, "Uninitialized variable")
+                .passthrough(id_map[n.name]))))
 
-    def visit_ID(self, n, scope, continuation):
-        for i in range(len(scope[0])-1, -1, -1):
-            if n.name in scope[0][i]:
-                id_map = scope[0][i]
-                break
-        else:
-            # TODO: change to my_assert
-            assert not self.require_decls, n.name
-
-        continuation.passthrough(lambda k:
-            # TODO: this is almost certainly wrong
-            ((lambda val: operator.setitem(id_map, n.name, val) or k(None)) if scope[1] == 'lvalue'
-                else lambda _: my_assert(n.name in id_map, "Undeclared identifier",
-                 lambda _: my_assert(id_map[n.name] is not None, "Uninitialized variable",
-                 lambda _: k(id_map[n.name])))))
-
-        return Info(n, continuation)
-
-    def visit_FileAST(self, n, scope, continuation):
+    def visit_FileAST(self, n):
         # TODO: put global map placement in here??
-        # Necessary lambda _?
-        continuation.loop(n.ext, passthrough=True, k=
-            lambda ext: lambda k:
-            lambda _: self.visit(ext, scope, k))
-        return Info(n, continuation)
+        (self.k.info(n)
+        .loop_var(n.ext)
+        .loop(lambda ext: self.k.visit(ext))
+        # don't really care about the return
+        .expect(lambda exts: None))
 
-    def visit_For(self, n, scope, continuation):
-        def for_inner(scope, continuation):
-            # TODO: scope probably has to be updated for continuations
-            continuation.passthrough(lambda k: \
-                lambda cond: self.visit(n.stmt, scope,
-                lambda flow:
-                    self.visit(n.next, scope,
-                               lambda _: for_inner(scope, k)) if flow is None or flow.type == 'Continue' \
-                    else k(None) if flow.type == 'Break' or flow.type != 'Return' \
-                    else k(flow)))
-            # TODO: is True the right default? can the condition even be empty?
-            continuation.passthrough(lambda k:
-                lambda _: self.visit(n.cond, k) if n.cond else k(Val('_Bool', True)))
+    def visit_For(self, n):
+        def for_inner():
+            self.k.info(n)
+            if n.cond: self.k.visit(n.cond)
+            else: self.k.passthrough(self.make_val('_Bool', True))
 
-            return Info(n, continuation)
+            (self.k.expect(lambda cond:
+                self.k
+                # TODO: need to cast types
+                .if_(cond.value, lambda: self.k
+                    .expect(lambda flow:
+                        (self.k
+                        .if_(flow.type == 'Normal' or flow.type == 'Continue', lambda: self.k
+                            .visit(n.next)
+                            .visit(for_inner))
+                        .else_if(flow.type == 'Return', lambda: self.k.passthrough(flow))
+                        .else_(lambda: self.k
+                            .kassert(flow.type == 'Break', 'blah')
+                            .passthrough(Flow('Normal'))))))
+                .else_(lambda: self.k
+                    .apply(self.pop_scope())
+                    .passthrough(Flow('Normal')))))
+
 
         # TODO: can we declare a variable in both for (int i) { int i; ??
-        continuation.passthrough(lambda k: lambda scope: for_inner(n, scope, k))
+        self.k.info(n)
+        # TODO only do this if n.init exists??
+        self.push_scope()
         if n.init:
-            continuation.wrap(
-                extend_scope(scope,
-                lambda scope: self.visit(n.init, scope,
-                lambda _: scope)))
-        else:
-            continuation.wrap(lambda _: scope)
-        return Info(n, continuation)
+            self.k.visit(n.init)
+        self.k.apply(for_inner())
 
-
-    def visit_FuncCall(self, n, scope, continuation):
+    def visit_FuncCall(self, n):
         # TODO: something about unused return value?
         # TODO: parse args for params / check types
         # TODO: deal with scope!!
         #if self.memory[n.name]['type'][0][0] == '(builtin)':
         # TODO: this needs to be expanded, since we might have weird types in c_utils?
-        continuation.wrap(
-            lambda val: expand_type(val.type, self.typedefs,
-            lambda type_: Val(type_, val.value)))
-        continuation.passthrough(lambda k:
-            lambda name: self.memory[name.value]['base'][0]([Val(['string'], "hello")], k))
 
-        #elif self.memory[name]['type'][0][0] == '(user-defined)':
-        #    # TODO: need to fix scope!!
-        #    val = self.visit(self.memory[name]['base'][0])
-        #    if flow is None:
-        #        continuation = my_assert(is_void_function(type_), "Didn't provide return value for non-void function",
-        #                continuation)
-        #    else:
-        #        continuation = my_assert(flow[0] == 'Return', "didn't return from FuncCall",
-        #                lambda _: my_assert(is_valid_return_value(type_, flow[1]), "Invalid return value", lambda _:
-        #                    continuation.func(flow[1])))
-        #else:
-        #    assert False
+        self.k.info(n).visit(n.name)
+        if n.args: self.k.visit(n.args)
+        else: self.k.passthrough([])
 
-        #if n.args:
-        #    continuation.wrap(
-        #        lambda name: self.visit(n.args, scope,
-        #        lambda args: (name, args)))
-        #else:
-        #    continuation.wrap(lambda name: (name, []))
+        (self.k.expect(lambda name: self.k.expect(lambda args:
+            (self.k
+            .if_(self.memory[n.name]['type'][0][0] == '(builtin)', lambda: self.k
+                .apply(self.memory[name.value]['base'][0]([self.make_val(['string'], "hello")], k)))
+            .else_(lambda: self.k
+                .kassert(self.memory[n.name]['type'][0][0] == '(user-defined)')
+                .apply(self.push_func_scope())
+                .visit(self.memory[name]['base'][0]))
+                .apply(self.pop_func_scope())
+                # TODO: check return type
+                .expect(lambda flow:
+                    (self.k
+                    .kassert(flow.type == 'Return', 'Didn\'t return from FuncCall')
+                    .passthrough(flow.value)))))))
 
-        continuation.passthrough(lambda k: self.visit(n.name, scope, k))
 
-        return Info(n, continuation)
 
-    def visit_Typedef(self, n, scope, continuation):
-        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
-        return Info(n, continuation)
+    def visit_Typedef(self, n):
+        self.k.info(n).visit(n.type)
 
-    def visit_TypeDecl(self, n, scope, continuation):
-        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
-        return Info(n, continuation)
+    def visit_TypeDecl(self, n):
+        self.k.info(n).visit(n.type)
 
-    def visit_ArrayDecl(self, n, scope, continuation):
-        continuation.wrap(lambda type_: lambda dim: ['[{}]'.format(dim)] + type_)
+    def visit_ArrayDecl(self, n):
+        self.k.info(n).visit(n.type)
         if n.dim:
-            continuation.wrap(lambda type_: self.visit(n.dim, scope, lambda dim: (type_, dim.value)))
-        else:
-            continuation.wrap(lambda type_: (type_, ''))
-        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
-        return Info(n, continuation)
+            (self.k
+            .visit(n.dim)
+            .expect(lambda dim: self.k.passthrough(str(dim.value))))
+        else: self.k.passthrough('')
+        self.k.expect(lambda type_: self.k.expect(lambda dim: ['[' + dim + ']'] + type_))
 
-    def visit_IdentifierType(self, n, scope, continuation):
-        continuation.wrap(lambda _: n.names)
-        return Info(n, continuation)
 
-    def visit_ParamList(self, n, scope, continuation):
+    def visit_IdentifierType(self, n):
+        self.k.info(n).passthrough(n.names)
+
+    def visit_ParamList(self, n):
         # TODO: can param.name be empty?
-        if n.params:
-            continuation.loop(n.params, k=
-                lambda param:
-                lambda params:
-                self.visit(param.type, scope,
-                lambda ptype: (params + [(param.name, ptype)])))
-        continuation.wrap(lambda _: [])
-        return Info(n, continuation)
+        (self.k.info(n)
+        .loop_var(n.params)
+        .loop(lambda param:
+            self.k
+            .visit(param.type)
+            .expect(lambda ptype: (param.name, ptype))))
 
-    def visit_FuncDecl(self, n, scope, continuation):
+    def visit_FuncDecl(self, n):
         # only the funcdef funcdecl will necessarily have parameter names
         # TODO: this can theoretically appear inside of funcdefs, but we would step over it
+        self.k.info(n).visit(n.type)
+
+        if n.args: self.k.visit(n.args)
+        else: self.k.expect(lambda ret_type: self.k.passthrough((ret_type, [], [])))
 
         # TODO: typedefs should be scoped
         #continuation.passthrough(lambda k:
         #    lambda ret_type: lambda params:
         #    expand_type([('(user-defined)', ret_type, params[0], params[1])], self.typedefs, k))
+        (self.k
+        .expect(lambda ret_type:
+            self.k.expect(lambda params: [('(user-defined)', ret_type, params[0], params[1])])))
 
-        #if n.args:
-        #    continuation.wrap(
-        #        lambda ret_type: self.visit(n.args, scope,
-        #        lambda param_names: lambda param_types: (ret_type, param_names, param_types)))
-        #else:
-        #    continuation.wrap(lambda ret_type: (ret_type, [], []))
 
-        #continuation.passthrough(lambda k: self.visit(n.type, scope, k))
 
-        continuation.wrap(lambda _: [('user-defined)', 'int', [], [])])
-        return Info(n, continuation)
-
-    def visit_FuncDef(self, n, scope, continuation):
+    def visit_FuncDef(self, n):
         # TODO: check against prior funcdecls?
-        continuation.passthrough(lambda k:
-            self.visit(n.decl, scope,
-            lambda type_: self.memory_init(n.decl.name, type_, 1, [n.body], 'text', k)))
-        return Info(n, continuation)
+        (self.k.info(n)
+        .visit(n.decl)
+        .expect(lambda type_: self.memory_init(n.decl.name, type_, 1, [n.body], 'text')))
 
 
-    def visit_If(self, n, scope, continuation):
-        continuation.passthrough(lambda k:
-            lambda cond: self.visit(n.iftrue, scope, k) if cond \
-            else self.visit(n.iffalse, scope, k))
+    def visit_If(self, n):
+        self.k.info(n)
+        if n.cond: self.k.visit(n.cond)
+        # TODO: cprrect default?
+        else: self.k.passthrough(self.make_val('_Bool', True))
 
-        continuation.passthrough(lambda k:
-            self.visit(n.cond, scope, k) if n.cond \
-            else k(Val('_Bool', True)))
+        self.k.expect(lambda cond:
+            self.k.visit(n.iftrue if cond else n.iffalse))
 
-        return Info(n, continuation)
+    def visit_PtrDecl(self, n):
+        (self.k.info(n)
+        .visit(n.type)
+        .expect(lambda type_: self.k.passthrough(['*'] + type_)))
 
-    def visit_PtrDecl(self, n, scope, continuation):
-        continuation.wrap(
-            lambda _: self.visit(n.type, scope,
-            lambda type_: ['*'] + type_))
-        return Info(n, continuation)
-
-    def visit_Struct(self, n, scope, continuation):
+    def visit_Struct(self, n):
         # TODO: finish this
-        if n.decls:
-            continuation.loop(n.decls, k=
-                lambda decl:
-                lambda vals: self.visit(decl, scope,
-                lambda val: (vals + [val])))
-        continuation.wrap(lambda _: [])
+        (self.k.info(n)
+        .loop_var(n.decls)
+        .loop(lambda decl: self.k.visit(decl)))
 
-        return Info(n, continuation)
-
-
-    def visit_Typename(self, n, scope, continuation):
-        # TODO: don't know when this is not None
+    def visit_Typename(self, n):
         # TODO: stuff with n.quals
-        if n.name: assert False
-        continuation.passthrough(lambda k: self.visit(n.type, scope, k))
-        return Info(n, continuation)
+        (self.k.info(n)
+        # TODO: don't know when this is not None
+        .kassert(not n.name, 'uh oh')
+        .visit(n.type))
 
     # TODO: account for overflow in binop/unop?
     def visit_UnaryOp(self, n):
@@ -799,10 +823,10 @@ class Interpreter(object):
         assert False
 
         # TODO: use types
-        type_, val = self.visit(n.expr)
+        type_, val = self.k.visit(n.expr)
         if n.op == 'p++' or n.op == 'p--' or n.op == '++p' or n.op == '--p':
             with self.context('lvalue'):
-                assignment_op = self.visit(n.expr)
+                assignment_op = self.k.visit(n.expr)
             # TODO: this doesn't handle post-increment correctly
             if n.op == 'p++' or n.op == '++p':
                 assignment_op(val + 1)
@@ -826,32 +850,49 @@ class Interpreter(object):
             return type_, unops[n.op](type_)(val)
 
     # TODO: detect infinite loop??
-    def visit_While(self, n, scope, continuation):
-        continuation.passthrough(lambda k:
-            lambda cond: self.visit(n.stmt, scope,
-            lambda flow: self.visit(n, scope, k) if flow is None or flow.type == 'Continue' \
-                         else k(None) if flow.type == 'Break' or flow.type != 'Return' \
-                         else k(flow)))
-        continuation.wrap(lambda _:
-            self.visit(n.cond, scope, continuation) if n.cond \
-            # TODO: is True the right default? can the condition even be empty?
-            else Val('_Bool', True))
+    def visit_While(self, n):
+        self.k.info(n)
 
-        return Info(n, continuation)\
+        if n.cond: self.k.visit(n.cond)
+        # TODO: is True the right default? can the condition even be empty?
+        else: self.k.passthrough(self.make_val('_Bool', True))
 
-    def visit_Return(self, n, scope, continuation):
+        (self.k.expect(lambda cond:
+            self.k
+            .if_(cond.value, lambda: self.k
+                .visit(n.stmt)
+                .expect(lambda flow: self.k
+                    .kassert(lambda: isinstance(flow, Flow))
+                    .if_(flow.type == 'Continue' or flow.type == 'Normal', lambda: self.k.visit(n))
+                    .else_if(flow.type == 'Break', lambda: self.k.passthrough(Flow('Normal')))
+                    .else_(lambda: self.k
+                        .kassert(flow.type == 'Return', 'blah')
+                        .passthrough(flow))))
+            .else_(lambda: self.k.passthrough(lambda: Flow('Normal')))))
+
+
+
+
+    def visit_Return(self, n):
+        self.k.info(n)
+        if n.expr: self.k.visit(n.expr)
+        # TODO: we very explicitly want this to pass through to self.k.expect, not to the upper continuation
+        else: self.k.passthrough(None)
+        self.k.expect(lambda val: self.k.passthrough(lambda: Flow('Return', val)))
+
         # TODO: can we even write a return outside of a function?
         # TODO: we need to check this elsewhere
         #assert continuations['return'] is not None, 'Return in invalid context'
-        continuation.wrap(lambda val: Val('Return', val))
-        continuation.passthrough(lambda k: (self.visit(n.expr, scope, k) if n.expr else k(None)))
-        return Info(n, continuation)
 
 def main():
     interpret = Interpreter()
     parser = c_parser.CParser()
     try:
-        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', r'-nostdinc', r'-Ifake_libc_include'])
+        # TODO: use a canonical set of header files, so we know what to expect?
+        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', '-nostdinc', r'-I../repair/fake_libc_include'])
+        #cpp_args = [r'-D__attribute__(x)=', r'-D__builtin_va_list=int',
+                    #r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=', '-E']
+        #cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E'])
         ast = parser.parse(cfile)
     except Exception as e:
         print('uh oh2', e)

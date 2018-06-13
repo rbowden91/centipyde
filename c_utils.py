@@ -40,8 +40,6 @@ def isupper(interpreter):
 
 def printf(interpreter):
     def helper(args):
-        print("**********")
-        print(args)
         new_args = []
         for arg in args:
             if isinstance(arg, Address):
