@@ -905,8 +905,11 @@ def preprocess_file(file_, is_code=False):
     #cpp_args.append(file_ if not is_code else '-')
 
     # reading from stdin
-    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
-    stdout, stderr = proc.communicate(file_ if is_code else None)
+    #proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
+    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+    stdout, stderr = proc.communicate(bytes(file_, 'latin-1') if is_code else None)
+    stdout = stdout.decode('latin-1')
+    stderr = stderr.decode('latin-1')
     if len(stderr) != 0:
         print('Uh oh! Stderr messages', proc.stderr)
     elif proc.returncode != 0:
