@@ -295,17 +295,17 @@ class Interpreter(object):
         self.context.append(context)
 
     def pop_func_scope(self):
-        self.k.info('pop func scope').apply(lambda: self.scope.pop())
+        self.k.info(('pop func scope',)).apply(lambda: self.scope.pop())
 
     def push_func_scope(self):
         # append the global map
-        self.k.info('push func scope').apply(lambda: self.scope.append([shelf.scope[0][0]]))
+        self.k.info(('push func scope',)).apply(lambda: self.scope.append([shelf.scope[0][0]]))
 
     def pop_scope(self):
-        self.k.info('pop scope').apply(lambda: self.scope[-1].pop())
+        self.k.info(('pop scope',)).apply(lambda: self.scope[-1].pop())
 
     def push_scope(self):
-        self.k.info('push scope').apply(lambda: self.scope[-1].append({}))
+        self.k.info(('push scope',)).apply(lambda: self.scope[-1].append({}))
 
     # TODO: preemptively expand, so that expand_type doesn't have to expand until no changes
     # are made?

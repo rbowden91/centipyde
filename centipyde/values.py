@@ -26,9 +26,16 @@ class Address(object):
         self.base = base
         self.offset = offset
 
+    def to_dict(self):
+        return {
+            'class': 'Address',
+            'base': self.base,
+            'offset': self.offset
+        }
+
+
     def __str__(self):
         return 'Address(' + str(self.base) + ', ' + str(self.offset) + ')'
-        return str(self)
 
     # TODO: is __str__ necessary at this point? will str() automatically call repr if __str__ doesn't exist??
     def __repr__(self):
@@ -46,6 +53,13 @@ class Flow(object):
     def __repr__(self):
         return str(self)
 
+    def to_dict(self):
+        return {
+            'class': 'Flow',
+            'type': self.type,
+            'value': self.value,
+        }
+
 class Memory(object):
     __slots__ = ['type', 'expanded_type', 'name', 'len', 'array', 'segment']
     def __init__(self, type_, expanded_type, name, len_, array, segment):
@@ -55,6 +69,17 @@ class Memory(object):
         self.len = len_
         self.array = array
         self.segment = segment
+
+    def to_dict(self):
+        return {
+            'class': 'Memory',
+            'type': self.type,
+            'expanded_type': self.expanded_type,
+            'name': self.name,
+            'len': self.len,
+            'array': self.array,
+            'segment': self.segment
+        }
 
 
 class Val(object):
@@ -69,3 +94,11 @@ class Val(object):
 
     def __repr__(self):
         return str(self)
+
+    def to_dict(self):
+        return {
+            'class': 'Val',
+            'type': self.type,
+            'expanded_type': self.expanded_type,
+            'value': self.value,
+        }
