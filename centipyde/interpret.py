@@ -1,17 +1,20 @@
 import sys
+import os
 import re
 import ctypes
 import inspect
 import operator
+import subprocess
 from contextlib import contextmanager
-from pycparser import c_generator, c_ast, c_lexer, c_parser, preprocess_file
+from pycparser import c_ast, c_parser
 
-from continuation import Continuation
 
 from inspect import signature, getsourcelines, getmembers
 
+from .values import *
+from .continuation import Continuation
+from . import c_utils
 
-import c_utils
 
 # TODO: check results for overflow???
 binops = {
@@ -50,16 +53,16 @@ def assert_false(str_ = ''):
     assert False, str_
 
 unops = {
-   '+': lambda: operator.pos,
-   '-': lambda: operator.neg,
-   '~': lambda: operator.inv,
-   '!': lambda: operator.not_,
-   'sizeof': lambda: assert_false("TODO")
+   '+': operator.pos,
+   '-': operator.neg,
+   '~': operator.inv,
+   '!': operator.not_,
    }
 
+unops['sizeof'] = lambda: assert_false("TODO")
 # shouldn't call these directly, since they require accessing memory/locals
 for k in ['*', '&', 'p++', '++p', 'p--', '--p']:
-    unops[k] = lambda _: assert_false("Shouldn't call these unops")
+    unops[k] = lambda: assert_false("Shouldn't call these unops")
 
 python_type_map = {
     '_Bool': ctypes.c_bool,
@@ -111,18 +114,18 @@ def cast_to_python_val(val):
 def expand_type(type_, typedefs):
     if type_ == []: return
     if is_func_type(type_):
-        return (type_[0], expand_type(type_[1], typedefs), type_[2], expand_type(type_[3], typedefs))
+        return [(type_[0], expand_type(type_[1], typedefs), type_[2], expand_type(type_[3], typedefs))]
     elif isinstance(type_, list):
-        ret = [expand_type(t, typedefs) for t in type_]
-        if isinstance(ret[0], list):
-            ret = [item for sublist in ret[0] for item in sublist]
+        ret = []
+        for t in type_:
+            ret = ret + expand_type(t, typedefs)
         return ret
     elif type_ in typedefs:
         return typedefs[type_]
     else:
         # TODO: how to handle this? Could still pass a continuation, but only to help with this error?
         #my_assert(type_ in python_type_map or type_.startswith('[') or type_ == '*' or type_ == '...', 'Invalid type')
-        return type_
+        return [type_]
 
 # TODO: depends on the value? idk...
 def is_char_type(type_):
@@ -159,56 +162,6 @@ def is_void_function(type_):
 # TODO: asserts shouldn't really be asserts, since then broken student code will crash this code
 # TODO: handle sizeof
 # can't inherit from genericvisitor, since we need to pass continuations everywhere
-
-class Address(object):
-    __slots__ = ['base', 'offset']
-    def __init__(self, base, offset):
-        self.base = base
-        self.offset = offset
-
-    def __str__(self):
-        return 'Address(' + str(self.base) + ', ' + str(self.offset) + ')'
-        return str(self)
-
-    # TODO: is __str__ necessary at this point? will str() automatically call repr if __str__ doesn't exist??
-    def __repr__(self):
-        return str(self)
-
-class Flow(object):
-    __slots__ = ['type', 'value']
-    def __init__(self, type_, value=None):
-        self.type = type_
-        self.value = value
-
-    def __str__(self):
-        return 'Flow(' + str(self.type) + ', ' + str(self.value) + ')'
-
-    def __repr__(self):
-        return str(self)
-
-class Memory(object):
-    __slots__ = ['type', 'expanded_type', 'name', 'len', 'array', 'segment']
-    def __init__(self, type_, expanded_type, name, len_, array, segment):
-        self.type = type_
-        self.expanded_type = expanded_type
-        self.name = name
-        self.len = len_
-        self.array = array
-        self.segment = segment
-
-
-class Val(object):
-    __slots__ = ['type', 'expanded_type', 'value']
-    def __init__(self, type_, expanded_type, value):
-        self.type = type_
-        self.value = value
-        self.expanded_type = expanded_type
-
-    def __str__(self):
-        return 'Val(' + str(self.type) + ', ' + str(self.value) + ')'
-
-    def __repr__(self):
-        return str(self)
 
 # make this a subclass, so the Continuation module doesn't need to know anything about
 # Interpreters
@@ -275,7 +228,8 @@ class Interpreter(object):
         self.memory = {}
         self.string_constants = {}
 
-        # TODO: typedefs should be scoped, too
+        # TODO: typedefs should be scoped, too. and structs. etc.
+        self.structs = {}
         self.typedefs = {}
         # TODO: how to handle NULL cleanly...
         self.memory_init('NULL', 'void', 0, [], 'NULL')
@@ -416,7 +370,7 @@ class Interpreter(object):
         self.push_scope()
         id_map = self.scope[-1][-1]
 
-        id_map['argc'] = self.make_val(['int'], len(argv) + 1)
+        id_map['argc'] = self.make_val(['int'], len(argv))
 
         # this is the name of the spot in self.memory
         # the second index is where in the array this id references
@@ -440,7 +394,7 @@ class Interpreter(object):
         self.k.visit(self.memory['main'].array[0])
 
     def visit(self, node):
-        node.show(showcoord=True)
+        #node.show(showcoord=True)
         method = 'visit_' + node.__class__.__name__
         ret = getattr(self, method)(node)
         assert ret is None
@@ -478,7 +432,15 @@ class Interpreter(object):
 
     def visit_Assignment(self, n):
         # TODO: handle others
-        assert n.op == '='
+        def assign_helper(lval, rval, assignment_op):
+            if n.op == '-=':
+                value = lval.value - rval.value
+            elif n.op == '+=':
+                value = lval.value + rval.value
+            else:
+                assert False, 'Unsupported unop'
+            value = self.make_val(lval.type, value)
+            self.k.apply(lambda: assignment_op(value)).passthrough(lambda: value)
 
         (self.k.info(n)
         .push_context('lvalue')
@@ -487,10 +449,14 @@ class Interpreter(object):
         .expect(lambda assignment_op: self.k
             .push_context('rvalue')
             .visit(n.rvalue)
-            .pop_context()
-            .expect(lambda val:
+            .expect(lambda val: self.k
                 # assignments return the value of the assignment
-                self.k.apply(lambda: assignment_op(val)).passthrough(lambda: val))))
+                # TODO: handle more than just these cases
+                .if_(n.op == '=', lambda: self.k.apply(lambda: assignment_op(val)).passthrough(lambda: val))
+                # not really an rvalue, but we need it
+                .else_(lambda: self.k.visit(n.lvalue).expect(lambda lval: self.k
+                    .apply(lambda: assign_helper(lval, val, assignment_op)))))
+            .pop_context()))
 
     def visit_Cast(self, n):
         # TODO: validate
@@ -614,8 +580,9 @@ class Interpreter(object):
                 .visit(n.init)
                 .pop_context()
                 # TODO: validate the type
-                .expect(lambda val: self.k.apply(lambda:
-                    self.update_scope(id_=n.name, val=self.make_val(type_, val.value))))))
+                .expect(lambda val: self.k
+                    .apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, val.value)))))
+            .else_(lambda: self.k.apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, None)))))
         .passthrough(lambda: Flow('Normal')))
 
     def visit_Decl(self, n):
@@ -628,10 +595,10 @@ class Interpreter(object):
         (self.k.info(n)
         .loop_var(n.decls)
         .loop(lambda decl:
-            self.k.visit(decl))
-        # do something?
-        .expect(lambda flows: None)
-        .passthrough(lambda: Flow('Normal')))
+            self.k.visit(decl)))
+        # we want the decls to pass through. Like for a struct's decls
+        #.expect(lambda decls: None)
+        #.passthrough(lambda: Flow('Normal')))
 
     def visit_ExprList(self, n):
         (self.k.info(n)
@@ -816,13 +783,19 @@ class Interpreter(object):
         # TODO: finish this
         (self.k.info(n)
         .loop_var(n.decls)
-        .loop(lambda decl: self.k.visit(decl)))
+        .loop(lambda decl: self.k.visit(decl))
+        .expect(lambda decls: self.k
+            .apply(lambda: operator.setitem(self.structs, n.name, decls))
+            .passthrough(lambda: [Struct(n.name, decls)])))
 
     def visit_Struct(self, n):
         # TODO: finish this
         (self.k.info(n)
         .loop_var(n.decls)
-        .loop(lambda decl: self.k.visit(decl)))
+        .loop(lambda decl: self.k.visit(decl))
+        .expect(lambda decls: self.k
+            .apply(lambda: operator.setitem(self.structs, n.name, decls))
+            .passthrough(lambda: [Struct(n.name, decls)])))
         # TODO do something with memory
 
     # Like if, but returns the Val instead of the Flow.
@@ -923,32 +896,33 @@ class Interpreter(object):
         # TODO: we need to check this elsewhere
         #assert continuations['return'] is not None, 'Return in invalid context'
 
-def main():
+def preprocess_file(file_, is_code=False):
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    include_path = os.path.join(dir_path, 'clib/build/include')
+    cpp_args = [r'clang', r'-E', r'-nostdinc', r'-I' + include_path,
+                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=',
+                '-']
+    #cpp_args.append(file_ if not is_code else '-')
+
+    # reading from stdin
+    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
+    stdout, stderr = proc.communicate(file_ if is_code else None)
+    if len(stderr) != 0:
+        print('Uh oh! Stderr messages', proc.stderr)
+    elif proc.returncode != 0:
+        print('Uh oh! Nonzero error code')
+    else:
+        return stdout
+
+# TODO: use getcwd for filename?
+def init_interpreter(file_, is_code=False):
     parser = c_parser.CParser()
+    # TODO: need to check for errors
     try:
-        # TODO: use a canonical set of header files, so we know what to expect?
-        #cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', '-nostdinc', r'-I../repair/fake_libc_include'])
-        cpp_args = [r'-D__attribute__(x)=', r'-D__builtin_va_list=int',
-                    r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=', r'-E', r'-nostdinc',
-                    r'-Iclib/build/include']
-        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=cpp_args)
-        #cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E'])
+        cfile = preprocess_file(file_, is_code)
         ast = parser.parse(cfile)
     except Exception as e:
         print('uh oh2', e)
         sys.exit(1)
 
-    interpret = Interpreter(ast)
-    # some kind of JIT after the first execution?
-    interpret.setup_main(['./vigenere', 'HELlO'], 'wOrld\n')
-    interpret.run()
-    assert len(interpret.k.passthroughs) == 1 == 1
-    # TODO: why is this passthrough double wrapped in context?
-    ret = interpret.k.get_passthrough(0)
-    assert len(interpret.k.passthroughs) == 0
-    print(ret)
-    print(ret.type, ret.value)
-    print(interpret.stdout)
-
-if __name__=='__main__':
-    main()
+    return Interpreter(ast)

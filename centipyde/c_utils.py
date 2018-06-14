@@ -1,5 +1,6 @@
-from interpret import Val, Address
 import operator
+
+from .values import Address, Val
 
 # TODO: strings should include \0...
 def GetString(interpreter):

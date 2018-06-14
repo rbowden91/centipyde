@@ -41,7 +41,7 @@ class Continuation(object):
 
     # passthrough is so that we don't process a passthrough from before this node was created
     def handle_expect(self, func):
-        print_lambda(func)
+        #print_lambda(func)
         val = self.get_passthrough()
         func(val)
 
@@ -130,15 +130,15 @@ class Continuation(object):
 
     def get_passthrough(self, idx=0):
         val, func = self.passthroughs.pop(idx)
-        print('Removing {} from idx {}, remaining {}, value generated at: '.format(
-            val, idx, self.passthroughs), end="")
-        print_lambda(func)
+        #print('Removing {} from idx {}, remaining {}, value generated at: '.format(
+        #    val, idx, self.passthroughs), end="")
+        #print_lambda(func)
         return val
 
     def put_passthrough(self, func):
-        print_lambda(func)
+        #print_lambda(func)
         val = func()
-        print('adding', val, self.passthroughs, '\n')
+        #print('adding', val, self.passthroughs, '\n')
         # keep around the func so we know where a value was generated
         self.passthroughs.append((val, func))
 
