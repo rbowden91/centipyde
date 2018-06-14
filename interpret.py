@@ -97,6 +97,9 @@ def cast_to_c_val(val):
     assert False, val.type
 
 def cast_to_python_val(val):
+    if is_char_type(val.expanded_type):
+        # TODO: check this over
+        return bytes(val.value, 'latin-1')[1 if val.value.startswith("'") else 0]
     if is_int_type(val.expanded_type):
         return int(val.value)
     elif is_float_type(val.expanded_type):
@@ -121,13 +124,16 @@ def expand_type(type_, typedefs):
         #my_assert(type_ in python_type_map or type_.startswith('[') or type_ == '*' or type_ == '...', 'Invalid type')
         return type_
 
+# TODO: depends on the value? idk...
+def is_char_type(type_):
+    return len(type_) == 1 and type_[0] == 'char'
+
+def is_float_type(type_):
+    return len(type_) == 1 and type_[0] in float_types
 
 def is_func_type(type_):
     #return type_[0].startswith('(')
     return isinstance(type_, tuple)
-
-def is_float_type(type_):
-    return len(type_) == 1 and type_[0] in float_types
 
 def is_int_type(type_):
     return len(type_) == 1 and type_[0] in int_types
@@ -269,8 +275,9 @@ class Interpreter(object):
         self.memory = {}
         self.string_constants = {}
 
-        # TODO: remove this hard-coding
-        self.typedefs = {'string': ['*', 'char'], 'size_t': ['int']}
+        # TODO: typedefs should be scoped, too
+        self.typedefs = {}
+        # TODO: how to handle NULL cleanly...
         self.memory_init('NULL', 'void', 0, [], 'NULL')
 
         # handle reading in all the typedefs, funcdefs, and everything, before we try to load in builtins (which may use
@@ -345,6 +352,12 @@ class Interpreter(object):
 
     def push_scope(self):
         self.k.info('push scope').apply(lambda: self.scope[-1].append({}))
+
+    # TODO: preemptively expand, so that expand_type doesn't have to expand until no changes
+    # are made?
+    def update_type(self, name, type_):
+        self.typedefs[name] = type_;
+        self.k.info(('new typedef', name, type_))
 
     def update_scope(self, id_, val):
 
@@ -427,7 +440,7 @@ class Interpreter(object):
         self.k.visit(self.memory['main'].array[0])
 
     def visit(self, node):
-        #node.show(showcoord=True)
+        node.show(showcoord=True)
         method = 'visit_' + node.__class__.__name__
         ret = getattr(self, method)(node)
         assert ret is None
@@ -443,7 +456,7 @@ class Interpreter(object):
         # TODO: we can have .expect take the type, to assert then and there?
         .expect(lambda arr: self.k.visit(n.subscript).expect(lambda idx:
             (self.k.pop_context()
-            .kassert(lambda: is_pointer_type(idx) != is_pointer_type(arr), "Only one can be an address"))
+            .kassert(lambda: is_pointer_type(idx) != is_pointer_type(arr), "Exactly one must be an address"))
             # TODO: this is an example of why everything should be lambdas. we can't actually
             # print idx before this
             .if_(is_pointer_type(idx), lambda: self.k.passthrough(lambda: idx.value).passthrough(lambda: arr.value))
@@ -719,21 +732,22 @@ class Interpreter(object):
 
 
     def visit_Typedef(self, n):
-        # TODO: something with memory
-        self.k.info(n).visit(n.type)#.expect(lambda type_: None)
+        # TODO: quals, storage, etc.
+        (self.k.info(n).visit(n.type)
+        .expect(lambda type_: self.k
+            .apply(lambda: self.update_type(n.name, type_))
+            .passthrough(lambda: Flow('Normal'))))
 
     def visit_TypeDecl(self, n):
         self.k.info(n).visit(n.type)
 
     def visit_ArrayDecl(self, n):
-        self.k.info(n).visit(n.type)
-        if n.dim:
-            (self.k
-            .visit(n.dim)
-            .expect(lambda dim: self.k.passthrough(lambda: str(dim.value))))
-        else: self.k.passthrough(lambda: '')
-        self.k.expect(lambda type_: self.k.expect(lambda dim:
-            self.k.passthrough(lambda: ['[' + dim + ']'] + type_)))
+        (self.k.info(n)
+        .visit(n.type)
+        .expect(lambda type_: self.k
+            .if_(n.dim, lambda: self.k.visit(n.dim).expect(lambda dim: self.k.passthrough(lambda: str(dim.value))))
+            .else_(lambda: self.k.passthrough(lambda: ''))
+            .expect(lambda dim: self.k.passthrough(lambda: ['[' + dim + ']'] + type_))))
 
 
     def visit_IdentifierType(self, n):
@@ -741,12 +755,16 @@ class Interpreter(object):
 
     def visit_ParamList(self, n):
         # TODO: can param.name be empty?
+        # TODO: ellipsisparam should only go at the end
         (self.k.info(n)
         .loop_var(n.params)
         .loop(lambda param:
             self.k
-            .visit(param.type)
-            .expect(lambda ptype: self.k.passthrough(lambda: (param.name, ptype)))))
+            .if_(isinstance(param, c_ast.EllipsisParam), lambda:
+                self.k.passthrough(lambda: ('...', None)))
+            .else_(lambda: self.k
+                .visit(param.type)
+                .expect(lambda ptype: self.k.passthrough(lambda: (param.name, ptype))))))
 
     def visit_FuncDecl(self, n):
         # only the funcdef funcdecl will necessarily have parameter names
@@ -794,12 +812,28 @@ class Interpreter(object):
         .visit(n.type)
         .expect(lambda type_: self.k.passthrough(lambda: ['*'] + type_)))
 
+    def visit_Union(self, n):
+        # TODO: finish this
+        (self.k.info(n)
+        .loop_var(n.decls)
+        .loop(lambda decl: self.k.visit(decl)))
+
     def visit_Struct(self, n):
         # TODO: finish this
         (self.k.info(n)
         .loop_var(n.decls)
         .loop(lambda decl: self.k.visit(decl)))
         # TODO do something with memory
+
+    # Like if, but returns the Val instead of the Flow.
+    # TODO:shouldn't it disallow
+    # some things inside of it?
+    def visit_TernaryOp(self, n):
+        (self.k.info(n)
+        .visit(n.cond)
+        .expect(lambda cond: self.k
+            .if_(cond.value, lambda: self.k.visit(n.iftrue))
+            .else_(lambda: self.k.visit(n.iffalse))))
 
     def visit_Typename(self, n):
         # TODO: stuff with n.quals
@@ -894,9 +928,10 @@ def main():
     try:
         # TODO: use a canonical set of header files, so we know what to expect?
         #cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', '-nostdinc', r'-I../repair/fake_libc_include'])
-        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E', '-nostdinc', r'-Iclib/build/include'])
-        #cpp_args = [r'-D__attribute__(x)=', r'-D__builtin_va_list=int',
-                    #r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=', '-E']
+        cpp_args = [r'-D__attribute__(x)=', r'-D__builtin_va_list=int',
+                    r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=', r'-E', r'-nostdinc',
+                    r'-Iclib/build/include']
+        cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=cpp_args)
         #cfile = preprocess_file(sys.argv[1], cpp_path='clang', cpp_args=['-E'])
         ast = parser.parse(cfile)
     except Exception as e:
