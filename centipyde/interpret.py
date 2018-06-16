@@ -270,7 +270,7 @@ class Interpreter(object):
 
     # TODO: this isn't nearly completely enough. for example, upcast int to long long
     def implicit_cast(self, val1, val2):
-        self.k.info('implicit_cast')
+        #self.k.info(('implicit_cast',))
         if is_int_type(val1.type) and is_float_type(val2.type):
             val1.value=float(val1.value)
             val1.type=val2.type
@@ -295,41 +295,48 @@ class Interpreter(object):
         self.context.append(context)
 
     def pop_func_scope(self):
-        self.k.info(('pop func scope',)).apply(lambda: self.scope.pop())
+        (self.k
+        .info(('pop_func_scope',), lambda scope: self.k.apply(lambda: self.push_func_scope(scope))
+                ).apply(lambda: self.scope.pop()))
 
-    def push_func_scope(self):
+    def push_func_scope(self, scope=None):
         # append the global map
-        self.k.info(('push func scope',)).apply(lambda: self.scope.append([shelf.scope[0][0]]))
+        self.k.info(('push_func_scope',), lambda _: self.k.apply(lambda: self.pop_func_scope())
+                ).apply(lambda: self.scope.append([shelf.scope[0][0]]))
 
     def pop_scope(self):
-        self.k.info(('pop scope',)).apply(lambda: self.scope[-1].pop())
+        (self.k
+        .info(('pop_scope',)).apply(lambda: self.scope[-1].pop()))
 
     def push_scope(self):
-        self.k.info(('push scope',)).apply(lambda: self.scope[-1].append({}))
+        self.k.info(('push_scope',)).apply(lambda: self.scope[-1].append({}))
 
     # TODO: preemptively expand, so that expand_type doesn't have to expand until no changes
     # are made?
     def update_type(self, name, type_):
         self.typedefs[name] = type_;
-        self.k.info(('new typedef', name, type_))
+        self.k.info(('new_typedef', name, type_))
 
-    def update_scope(self, id_, val):
+    def update_scope(self, id_, val, scope=-1):
 
-        self.scope[-1][-1][id_] = val
+        # do this just for the self.k.info purposes
+        old_var = id_ in self.scope[-1][scope]
 
-        self.k.info(('update_scope', id_, val))
+        self.scope[-1][scope][id_] = val
+
+        self.k.info(('update_scope', {'name': id_, 'value': val, 'old_var': old_var, 'scope': scope}))
 
 
     def update_memory(self, base, offset, val):
         # TODO: check types
         self.memory[base].array[offset] = val.value
-        self.k.info(('memory-update', base, offset, val.value))
+        self.k.info(('memory_update', base, offset, val.value))
 
     def memory_init(self, name, type_, len_, array, segment):
         expanded_type = expand_type(type_, self.typedefs)
         self.memory[name] = Memory(type_, expanded_type, name, len_, array, segment)
         (self.k
-        .info(('memory-init', name, type_, len_, array, segment)))
+        .info(('memory_init', self.memory[name])))
         #.passthrough(self.memory[name]))
 
     #def update_memory(self, arr, val):
@@ -378,7 +385,7 @@ class Interpreter(object):
 
         # TODO: environment variables as well?
         self.memory_init('argv', ['*', 'char'], len(argv) + 1,
-            [Address('argv[' + str(i) + ']', 0) for i in range(len(argv))] + [('NULL', 0)], 'argv')
+            [Address('argv[' + str(i) + ']', 0) for i in range(len(argv))] + [Address('NULL', 0)], 'argv')
 
         for i in range(len(argv)):
             array = bytearray(argv[i], 'latin-1') + bytearray([0])
@@ -609,24 +616,22 @@ class Interpreter(object):
         def helper():
             for i in range(len(self.scope[-1])-1, -1, -1):
                 if n.name in self.scope[-1][i]:
-                    id_map = self.scope[-1][i]
-                    self.k.passthrough(lambda: id_map)
+                    self.k.passthrough(lambda: i)
                     return
             else:
                 (self.k
                 .kassert(lambda: not self.require_decls, 'Undeclared identifier: ' + n.name)
-                .passthrough(lambda: self.scope[-1][-1]))
+                .passthrough(lambda: -1))
 
         (self.k.info(n)
         .apply(helper)
-        .expect(lambda id_map:
+        .expect(lambda scope:
             self.k
             .if_(self.context[-1] == 'lvalue', lambda: self.k
-                .passthrough(lambda: lambda val: operator.setitem(id_map, n.name, val)))
+                .passthrough(lambda: lambda val: self.update_scope(n.name, val, scope)))
             .else_(lambda: self.k
-                .kassert(lambda: n.name in id_map, "Undeclared identifier")
-                .kassert(lambda: id_map[n.name].value is not None, "Uninitialized variable")
-                .passthrough(lambda: id_map[n.name]))))
+                .kassert(lambda: self.scope[-1][scope][n.name].value is not None, "Uninitialized variable")
+                .passthrough(lambda: self.scope[-1][scope][n.name]))))
 
     def visit_FileAST(self, n):
         # TODO: put global map placement in here??
@@ -899,7 +904,7 @@ class Interpreter(object):
 def preprocess_file(file_, is_code=False):
     dir_path = os.path.dirname(os.path.realpath(__file__))
     include_path = os.path.join(dir_path, 'clib/build/include')
-    cpp_args = [r'clang', r'-E', r'-nostdinc', r'-I' + include_path,
+    cpp_args = [r'cpp', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
                 r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=',
                 '-']
     #cpp_args.append(file_ if not is_code else '-')
