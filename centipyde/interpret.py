@@ -1,170 +1,75 @@
+# TODO: is there some kind of generator-based approach we could take instead?? Would we then lose the ability to take
+# out the generators by using the ast trick?
 import sys
 import os
-import re
-import ctypes
-import inspect
-import operator
 import subprocess
-from contextlib import contextmanager
-from pycparser import c_ast, c_parser
 
+# TODO: eventually handle this. pycparser doesn't play nicely with mypy yet
+from pycparser import c_ast, c_parser # type: ignore
 
-from inspect import signature, getsourcelines, getmembers
-
-from .values import *
+from .crt import CRuntime
 from .continuation import Continuation
-from . import c_utils
 
 
-# TODO: check results for overflow???
-binops = {
-    '+': lambda type_: (type_, operator.add),
-    '-': lambda type_: (type_, operator.sub),
-    '*': lambda type_: (type_, operator.mul),
-    # TODO: division by zero runtime error
-    '/': lambda type_: (type_, (operator.truediv if is_float_type(type_) else operator.floordiv)),
-    # TODO: assert something about type_ being int,
-    '%': lambda type_: (type_, operator.mod),
+# This only knows about "flows". No other values are really relevant
 
-    '|': lambda type_: (type_, operator.or_),
-    '&': lambda type_: (type_, operator.and_),
-    '^': lambda type_: (type_, operator.xor),
-    '<<': lambda type_: (type_, operator.lshift),
-    # TODO: something with unsigned right shift??,
-    '>>': lambda type_: (type_, operator.rshift),
+class Flow(object):
+    __slots__ = ['type', 'value']
+    def __init__(self, type_, value=None):
+        self.type = type_
+        self.value = value
 
-    # TODO: any issues with falsiness?,
-    # TODO: what type does a boolean comparison return?,
-    # TODO: these are returning True instead of 1
-    '==': lambda type_: (['int'], operator.eq),
-    '!=': lambda type_: (['int'], operator.ne),
-    '<': lambda type_: (['int'], operator.lt),
-    '<=': lambda type_: (['int'], operator.le),
-    '>': lambda type_: (['int'], operator.gt),
-    '>=': lambda type_: (['int'], operator.ge),
+    def __str__(self):
+        return 'Flow(' + str(self.type) + ', ' + str(self.value) + ')'
 
-    # && and || are special, because they can short circuit. By the time we call this function, short-circuiting
-    # should already have been checked for
-    '&&': lambda type_: (['int'], lambda lval, rval: 1 if rval else 0),
-    '||': lambda type_: (['int'], lambda lval, rval: 1 if rval else 0)
-}
+    def __repr__(self):
+        return str(self)
 
-def assert_false(str_ = ''):
-    assert False, str_
+    def to_dict(self):
+        return {
+            'class': 'Flow',
+            'type': self.type,
+            'value': self.value,
+        }
 
-unops = {
-   '+': operator.pos,
-   '-': operator.neg,
-   '~': operator.inv,
-   '!': operator.not_,
-   }
+def preprocess_file(file_, is_code=False):
+    dir_path = os.path.dirname(os.path.realpath(__file__))
+    include_path = os.path.join(dir_path, 'clib/build/include')
+    cpp_args = [r'cpp', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
+                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=',
+                '-']
+    #cpp_args.append(file_ if not is_code else '-')
 
-unops['sizeof'] = lambda: assert_false("TODO")
-# shouldn't call these directly, since they require accessing memory/locals
-for k in ['*', '&', 'p++', '++p', 'p--', '--p']:
-    unops[k] = lambda: assert_false("Shouldn't call these unops")
-
-python_type_map = {
-    '_Bool': ctypes.c_bool,
-    'char': ctypes.c_char,
-    'unsigned char': ctypes.c_bool,
-    'short': ctypes.c_bool,
-    'unsigned short': ctypes.c_bool,
-    'int': ctypes.c_bool,
-    'unsigned int': ctypes.c_bool,
-    'long': ctypes.c_bool,
-    'unsigned long': ctypes.c_bool,
-    'long long': ctypes.c_bool,
-    'unsigned long long': ctypes.c_bool,
-    'float': ctypes.c_bool,
-    'double': ctypes.c_bool,
-    'long double': ctypes.c_bool,
-}
-
-int_types = set(['_Bool'])
-for t in ['char', 'short', 'int', 'long', 'long long']:
-    int_types.add(t)
-    int_types.add('unsigned ' + t)
-float_types = set(['float', 'double', 'long double'])
-
-builtin_funcs = { name: func for name, func in inspect.getmembers(c_utils, inspect.isfunction) }
-
-# TODO: this is wildly incomplete?
-def cast_to_c_val(val):
-    if is_pointer_type(val.type) or is_func_type(val.type):
-        # TODO: use the other types from https://docs.python.org/3/library/ctypes.html?
-        return val
-    if val.type[0] in python_type_map:
-        assert len(type_) == 1, "This should always be true, right??"
-        return python_type_map[val.type[0]](val.value).value
-    assert False, val.type
-
-def cast_to_python_val(val):
-    if is_char_type(val.expanded_type):
-        # TODO: check this over
-        return bytes(val.value, 'latin-1')[1 if val.value.startswith("'") else 0]
-    if is_int_type(val.expanded_type):
-        return int(val.value)
-    elif is_float_type(val.expanded_type):
-        return float(val.value)
-    elif is_string_type(val.expanded_type) or is_pointer_type(val.expanded_type):
-        return val.value
-    assert False, val.expanded_type
-
-def expand_type(type_, typedefs):
-    if type_ == []: return
-    if is_func_type(type_):
-        return [(type_[0], expand_type(type_[1], typedefs), type_[2], expand_type(type_[3], typedefs))]
-    elif isinstance(type_, list):
-        ret = []
-        for t in type_:
-            ret = ret + expand_type(t, typedefs)
-        return ret
-    elif type_ in typedefs:
-        return typedefs[type_]
+    # reading from stdin
+    #proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
+    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+    stdout, stderr = proc.communicate(bytes(file_, 'latin-1') if is_code else None)
+    stdout = stdout.decode('latin-1')
+    stderr = stderr.decode('latin-1')
+    if len(stderr) != 0:
+        print('Uh oh! Stderr messages', proc.stderr)
+    elif proc.returncode != 0:
+        print('Uh oh! Nonzero error code')
     else:
-        # TODO: how to handle this? Could still pass a continuation, but only to help with this error?
-        #my_assert(type_ in python_type_map or type_.startswith('[') or type_ == '*' or type_ == '...', 'Invalid type')
-        return [type_]
+        return stdout
 
-# TODO: depends on the value? idk...
-def is_char_type(type_):
-    return len(type_) == 1 and type_[0] == 'char'
+# TODO: use getcwd for filename?
+def init_interpreter(file_, is_code=False):
+    parser = c_parser.CParser()
+    # TODO: need to check for errors
+    try:
+        cfile = preprocess_file(file_, is_code)
+        ast = parser.parse(cfile)
+    except Exception as e:
+        print('uh oh2', e)
+        sys.exit(1)
 
-def is_float_type(type_):
-    return len(type_) == 1 and type_[0] in float_types
-
-def is_func_type(type_):
-    #return type_[0].startswith('(')
-    return isinstance(type_, tuple)
-
-def is_int_type(type_):
-    return len(type_) == 1 and type_[0] in int_types
-
-def is_pointer_type(type_):
-    if isinstance(type_, Val):
-        type_ = type_.expanded_type
-    return type_[0].startswith('[') or type_[0] == '*'
-
-def is_string_type(type_):
-    return len(type_) == 2 and is_pointer_type(type_[0]) and type_[1] == 'char'
-
-def types_match(type1, type2):
-    return type1 == type2
-
-def is_valid_return_value(functype, val):
-    return types_match(functype[0][1], val.type)
-
-def is_void_function(type_):
-    return type_[0][1] == 'void'
+    return Interpreter(ast)
 
 # TODO: cache results from particularly common subtrees?
-# TODO: asserts shouldn't really be asserts, since then broken student code will crash this code
-# TODO: handle sizeof
-# can't inherit from genericvisitor, since we need to pass continuations everywhere
 
-# make this a subclass, so the Continuation module doesn't need to know anything about
-# Interpreters
+# Make this a subclass, so the Continuation module doesn't need to know anything about
+# Interpreters. This is mostly just convenience methods.
 class InterpContinuation(Continuation):
 
     __slots__ = ['interpreter']
@@ -172,15 +77,14 @@ class InterpContinuation(Continuation):
         self.interpreter = interpreter
         super().__init__()
 
-    # These are all just convenience functions for common interpreter ops
-
     def visit(self, node):
         assert isinstance(node, c_ast.Node)
         self.apply(lambda: self.interpreter.visit(node))
         return self
 
     def push_context(self, context):
-        self.apply(lambda: self.interpreter.push_context(context))
+        (self.apply(lambda: self.interpreter.context.append(context),
+                    lambda: self.interpreter.context.pop()))
         return self
 
     def pop_context(self):
@@ -189,17 +93,138 @@ class InterpContinuation(Continuation):
         # lambda was defined. Not particularly interesting in this case, though.
 
         # TODO: provide more information about the caller, so that we have better
-        # line numbers for the lambda printing? Almost like inlining...
-        self.apply(lambda: self.interpreter.pop_context())
+        # line numbers for the lambda printing? Almost like inlining... Actually, better yet,
+        # keep around the full lambda stacktrace wooo
+        (self.passthrough(lambda: self.interpreter.context[-1])
+        .expect(lambda context:
+            self.apply(lambda: self.interpreter.context.pop(),
+                       lambda: self.interpreter.context.append(context))))
         return self
 
-    def push_scope(self):
-        self.apply(lambda: self.interpreter.push_scope())
+    # call out to the C runtime, which might touch some global state
+    def side_effect(self, *args):
+        (forward, reverse, error, result) = self.interpreter.crt.side_effect(args)
+        self.apply(forward, reverse)
         return self
 
-    def pop_scope(self):
-        self.apply(lambda: self.interpreter.pop_scope())
-        return self
+
+    #def push_scope(self):
+    #    (self.info(('push_scope',{}), ('pop_scope',{}))
+    #    .apply(lambda: self.cwrapper.scope[-1].append({}),
+    #           lambda: self.cwrapper.scope[-1].pop()))
+    #    return self
+
+    #def pop_scope(self):
+    #    (self.passthrough(lambda: self.cwrapper.scope[-1][-1])
+    #    .expect(lambda scope:
+    #        self.info(('pop_scope',scope),('push_scope',scope))
+    #        .apply(lambda: self.cwrapper.scope[-1].pop(),
+    #               lambda: self.cwrapper.scope[-1].append(scope))))
+    #    return self
+
+
+    #def declare_typedef(self, name, type_):
+    #    (self.info(('declare_typedef', name, type_), ('remove_typedef', name))
+    #    .apply(lambda: self.cwrapper.declare_typedef(name, type_),
+    #           lambda: self.cwrapper.remove_typedef(name))
+    #    .passthrough(lambda: Flow('Normal')))
+    #    return self
+
+    #def declare_union(self, name, decls):
+    #    (self.apply(lambda: self.passthrough(self.cwrapper.declare_union(name, decls)),
+    #                lambda: self.cwrapper.remove_union(name))
+    #    .expect(lambda union:
+    #        self.info(('declare_union', union), ('remove_union', union))
+    #        .passthrough(lambda: union)))
+    #    return self
+
+    ## TODO: update struct, after a forward declaration??
+    #def declare_struct(self, name, decls):
+    #    (self.apply(lambda: self.passthrough(self.cwrapper.declare_struct(name, decls)),
+    #                lambda: self.cwrapper.remove_struct(name))
+    #    .expect(lambda struct:
+    #        self.info(('declare_struct', struct), ('remove_struct', struct))
+    #        .passthrough(lambda: struct)))
+    #    return self
+
+    #def pop_func_scope(self):
+    #    (self.passthrough(lambda: self.cwrapper.scope[-1][-1])
+    #    .expect(lambda scope:
+    #        self.info(('pop_func_scope',scope),('push_func_scope',scope))
+    #        .apply(lambda: self.cwrapper.scope.pop(),
+    #               lambda: self.cwrapper.scope.append(scope))))
+    #    return self
+
+    #def push_func_scope(self, scope=None):
+    #    # append the global map
+    #    (self.passthrough(lambda: [self.cwrapper.scope[-1][0]])
+    #    .expect(lambda scope:
+    #        (self.info(('push_func_scope',scope), ('pop_func_scope',scope))
+    #        .apply(lambda: self.cwrapper.scope.append([{}]),
+    #            lambda: self.cwrapper.scope.pop()))))
+    #    return self
+
+    ## TODO: preemptively expand, so that expand_type doesn't have to expand until no changes
+    ## are made?
+
+    ## XXX XXX XXX: these assignment values should passthrough
+    #def declare_id(self, id_, val):
+    #    (self.k.info(('declare_id', {'name': id_, 'value': val}), ('remove_id', {'name': id_}))
+    #    .apply(lambda: self.cwrapper.declare_id(id_, val),
+    #           lambda: self.cwrapper.remove_id(id_)))
+
+    #def update_id(self, id_, val, scope=-1):
+    #    (self.k.passthrough(lambda: self.scope[-1]['ids'][id_])
+    #    .expect(lambda old_val:
+    #        self.k.info(('update_id', {'name': id_, 'value': val, 'scope': scope}),
+    #                    ('update_id', {'name': id_, 'value': old_val, 'scope': scope}))
+    #        .apply(lambda: self.k.passthrough(self.cwrapper.update_id(id_, val, scope)),
+    #               lambda: self.cwrapper.update_id(id_, oldval, scope))))
+
+    ## TODO: need to handle stack pointers eventually
+    #def allocate_memory(self, name, type_, len_, array, segment):
+    #    (self
+    #    .apply(lambda: self.k.passthrough(lambda: self.cwrapper.allocate_memory(name, type_, len_, array, segment)),
+    #           lambda: self.cwrapper.deallocate_memory(name))
+    #    .expect(lambda memory:
+    #            self.k.info(('allocate_memory', memory), ('deallocate_memory', name))
+    #            .passthrough(lambda: memory)))
+
+    #def deallocate_memory(self, name):
+    #    # TODO
+    #    pass
+
+
+    #def update_memory(self, base, offset, val):
+    #    # TODO: use a getter instead of directly accessing?
+    #    # TODO: check types
+    #    (self.k.passthrough(lambda: self.cwrapper.memory[base].array[offset])
+    #    .expect(lambda old_val:
+    #        self.k.info(('update_memory', {'name': id_, 'base': base, 'offset': offset, 'value': val}),
+    #                    ('update_memory', {'name': id_, 'base': base, 'offset': offset, 'value': old_val}))
+    #        .apply(lambda: self.k.passthrough(self.cwrapper.update_memory(base, offset, val)),
+    #               lambda: self.cwrapper.update_memory(base, offset, oldval))))
+
+    ## TODO: this should really be done at the beginning of the program, to pre-load everything into memory...
+    ## TODO: also, globals. Oof. Those aren't on the stack...
+    #def handle_string_const(self, type_):
+    #    # TODO: check how it's being declared, since we might be doing a mutable character array
+    #    # TODO: move this into cwrapper
+    #    self.k.info('strconst')
+
+    #    if n.value in self.string_constants:
+    #        new = False
+    #        name = self.cwrapper.string_constants[n.value]
+    #    else:
+    #        new = True
+    #        const_num = len(self.string_constants)
+    #        # should be unique in memory, since it has a space in the name
+    #        name = 'strconst ' + str(const_num)
+    #        self.cwrapper[n.value] = name
+    #        # append 0 for the \0 character
+    #        array = bytes(n.value, 'latin-1') + bytes([0])
+    #        self.memory_init(name, type_, len(array), array, 'rodata')
+    #    self.k.passthrough(lambda: self.make_val(type_, Address(name, 0)))
 
     # TODO: extend passthrough so we add in where the value was generated to each Val that's
     # passed through?
@@ -207,49 +232,30 @@ class InterpContinuation(Continuation):
     # memory the origin of a value??
 
 class Interpreter(object):
+    # TODO: pass require_decls through to cwrapper
     def __init__(self, ast, require_decls=True):
+        # If false, we don't require type declarations before assigning to a variable (unlike regular C)
         self.require_decls = require_decls
 
         self.ast = ast
         self.k = InterpContinuation(self)
-        self.rk = InterpContinuation(self)
 
-        self.k
-
-        self.stdin = None
-        self.stdout = ''
-        self.stderr = ''
-        self.filesystem = {}
-
-        self.scope = [[{}]]
+        # context isn't that interesting. it's just what "context" we're in at a given node. In particular, are we being
+        # actively parsed as an lvalue or an rvalue
         self.context = ['global']
 
-        # values are tuples of type, num_elements, and array of elements
-        self.memory = {}
-        self.string_constants = {}
-
-        # TODO: typedefs should be scoped, too. and structs. etc.
-        self.structs = {}
-        self.typedefs = {}
-        # TODO: how to handle NULL cleanly...
-        self.memory_init('NULL', 'void', 0, [], 'NULL')
-
-        # handle reading in all the typedefs, funcdefs, and everything, before we try to load in builtins (which may use
-        # typedefs)
+        # read in all the typedefs, funcdefs, globals, etc.
+        # this is effectively "compiling", but only by looking at top-level things
+        # TODO: Probably need to make explicit the iteration over globals
+        self.runtime = CRuntime(require_decls)
         self.visit(ast)
         self.run()
 
-        for name in builtin_funcs:
-            type_, func = builtin_funcs[name](self)
-            val = self.make_val(type_, name)
-            self.update_scope(name, val)
-            self.memory_init(name, type_, 1,
-                    [(lambda func: lambda args: self.k.passthrough(lambda: func(args)))(func)], 'text')
-        self.run()
+        # so that we don't have to directly access the continuation
+        self.step = self.k.step
+        self.revstep = self.k.revstep
 
-    def step(self):
-        return self.k.step()
-
+    # run until we can't process things anymore
     def run(self):
         while True:
             ret = self.step()
@@ -261,150 +267,22 @@ class Interpreter(object):
                 #    print(ret)
             else:
                 break
+        # get the return value and store it in interpreter here?
 
-    def make_val(self, type_, val):
-        # TODO: associate the expanded_type with types_ instead of with vals?
-        assert isinstance(type_, list)
-        expanded_type = expand_type(type_, self.typedefs)
-        return Val(type_, expanded_type, val)
-
-    # TODO: this isn't nearly completely enough. for example, upcast int to long long
-    def implicit_cast(self, val1, val2):
-        #self.k.info(('implicit_cast',))
-        if is_int_type(val1.type) and is_float_type(val2.type):
-            val1.value=float(val1.value)
-            val1.type=val2.type
-        elif is_float_type(val1.type) and is_int_type(val2.type):
-            val2.value=float(val2.value)
-            val2.type=val1.type
-        # can only compare against NULL pointer if it's an int
-        elif is_int_type(val1.type) and is_pointer_type(val2.type):
-            self.k.kassert((lambda val: lambda: val == 0)(val1.value), 'blah8 ' + str(val1.value))
-            val1.value = Address('NULL', 0)
-            val1.type = val2.type
-        elif is_int_type(val2.type) and is_pointer_type(val1.type):
-            self.k.kassert((lambda val: lambda: val == 0)(val2.value), 'blah9 ' + str(val2.value))
-            val2.value = Address('NULL', 0)
-            val2.type = val1.type
-        self.k.passthrough(lambda: val1).passthrough(lambda: val2)
-
-    def pop_context(self):
-        self.context.pop()
-
-    def push_context(self, context):
-        self.context.append(context)
-
-    def pop_func_scope(self):
-        (self.k
-        .info(('pop_func_scope',), lambda scope: self.k.apply(lambda: self.push_func_scope(scope))
-                ).apply(lambda: self.scope.pop()))
-
-    def push_func_scope(self, scope=None):
-        # append the global map
-        self.k.info(('push_func_scope',), lambda _: self.k.apply(lambda: self.pop_func_scope())
-                ).apply(lambda: self.scope.append([shelf.scope[0][0]]))
-
-    def pop_scope(self):
-        (self.k
-        .info(('pop_scope',)).apply(lambda: self.scope[-1].pop()))
-
-    def push_scope(self):
-        self.k.info(('push_scope',)).apply(lambda: self.scope[-1].append({}))
-
-    # TODO: preemptively expand, so that expand_type doesn't have to expand until no changes
-    # are made?
-    def update_type(self, name, type_):
-        self.typedefs[name] = type_;
-        self.k.info(('new_typedef', name, type_))
-
-    def update_scope(self, id_, val, scope=-1):
-
-        # do this just for the self.k.info purposes
-        old_var = id_ in self.scope[-1][scope]
-
-        self.scope[-1][scope][id_] = val
-
-        self.k.info(('update_scope', {'name': id_, 'value': val, 'old_var': old_var, 'scope': scope}))
-
-
-    def update_memory(self, base, offset, val):
-        # TODO: check types
-        self.memory[base].array[offset] = val.value
-        self.k.info(('memory_update', base, offset, val.value))
-
-    def memory_init(self, name, type_, len_, array, segment):
-        expanded_type = expand_type(type_, self.typedefs)
-        self.memory[name] = Memory(type_, expanded_type, name, len_, array, segment)
-        (self.k
-        .info(('memory_init', self.memory[name])))
-        #.passthrough(self.memory[name]))
-
-    #def update_memory(self, arr, val):
-    #    (self.k
-    #    .info((name, self.memory))
-    #    .passthrough(lambda: self.memory[arr].seti))
-
-    def handle_string_const(self, type_):
-        # TODO: check how it's being declared, since we might be doing a mutable character array
-        self.k.info('strconst')
-
-        if n.value in self.string_constants:
-            name = self.string_constants[n.value]
-        else:
-            const_num = len(self.string_constants)
-            # should be unique in memory, since it has a space in the name
-            name = 'strconst ' + str(const_num)
-            self.string_constants[n.value] = name
-            # append 0 for the \0 character
-            array = bytes(n.value, 'latin-1') + bytes([0])
-            self.memory_init(name, type_, len(array), array, 'rodata')
-        self.k.passthrough(lambda: self.make_val(type_, Address(name, 0)))
-
-    # executes a program from the main function
-    # shouldn't call this multiple times, since memory might be screwed up (global values not reinitialized, etc.)
-    # TODO: _start??
-    def setup_main(self, argv, stdin):
-
-        # TODO: need to reset global variables to initial values as well
-        #for i in list(self.memory.keys()):
-        #    if self.memory[i]['segment'] in ['heap', 'stack', 'argv']:
-        #        del(self.memory[i])
-
-        # TODO: validate argv
-
-        # TODO: no matching pop_scope. Return could do that, but not all functions call
-        # return. Make this an explicit call to a "FuncCall" node?
-        self.push_scope()
-        id_map = self.scope[-1][-1]
-
-        id_map['argc'] = self.make_val(['int'], len(argv))
-
-        # this is the name of the spot in self.memory
-        # the second index is where in the array this id references
-        id_map['argv'] = self.make_val(['*', '*', 'char'], Address('argv', 0))
-
-        # TODO: environment variables as well?
-        self.memory_init('argv', ['*', 'char'], len(argv) + 1,
-            [Address('argv[' + str(i) + ']', 0) for i in range(len(argv))] + [Address('NULL', 0)], 'argv')
-
-        for i in range(len(argv)):
-            array = bytearray(argv[i], 'latin-1') + bytearray([0])
-            self.memory_init('argv[' + str(i) + ']', ['char'], len(array), array, 'argv')
-            #for j in range(len(argv[i])):
-            #    self.memory['argv[' + str(i) + '][' + str(j) + ']'] = ('char', 1, [argv[i][j]])
-
-
-        self.stdout = ''
-        self.stderr = ''
-        self.stdin = stdin
-
-        self.k.visit(self.memory['main'].array[0])
-
+    # We don't really need the caching anymore that pycparser uses, since we no longer visit nodes multiple times
     def visit(self, node):
         #node.show(showcoord=True)
         method = 'visit_' + node.__class__.__name__
         ret = getattr(self, method)(node)
         assert ret is None
+
+    def visit_ArrayDecl(self, n):
+        (self.k.info(n)
+        .visit(n.type)
+        .expect(lambda type_: self.k
+            .if_(n.dim, lambda: self.k.visit(n.dim).expect(lambda dim: self.k.passthrough(lambda: str(dim.value))))
+            .else_(lambda: self.k.passthrough(lambda: ''))
+            .expect(lambda dim: self.k.passthrough(lambda: [type_ + '[' + dim + ']'] + type_))))
 
     def visit_ArrayRef(self, n):
         # TODO: shouldn't be allowed to assign to symbols / consts? Actually, symbols would fall under visit_ID
@@ -414,28 +292,32 @@ class Interpreter(object):
         # we want to get rid of any lvalue context if we are eventually assigning to the array
         .push_context('arrayref')
         .visit(n.name)
-        # TODO: we can have .expect take the type, to assert then and there?
         .expect(lambda arr: self.k.visit(n.subscript).expect(lambda idx:
             (self.k.pop_context()
-            .kassert(lambda: is_pointer_type(idx) != is_pointer_type(arr), "Exactly one must be an address"))
-            # TODO: this is an example of why everything should be lambdas. we can't actually
-            # print idx before this
-            .if_(is_pointer_type(idx), lambda: self.k.passthrough(lambda: idx.value).passthrough(lambda: arr.value))
-            .else_(lambda: self.k.passthrough(lambda: arr.value).passthrough(lambda: idx.value))))
+            # if they did something like 2[arr], which is legal, crt will handle that
+            # XXX XXX XXX XXX
+            .side_effect('')))))
 
-        .expect(lambda arr: self.k.expect(lambda idx:
-            self.k
-            .kassert(lambda: idx + arr.offset < self.memory[arr.base].len,
-                'Out of bounds array:{} idx:{} length:{}'.format(arr.base, idx, self.memory[arr.base].len))
-            .if_(self.context[-1] == 'lvalue',
-                lambda: self.k
-                .kassert(lambda: self.memory[arr.base].segment not in ['rodata', 'text', 'NULL'],
-                         self.memory[arr.base].segment)
-                .passthrough(lambda: lambda val:
-                    self.update_memory(arr.base, idx+arr.offset, val)))
-            .else_(lambda: self.k
-                .passthrough(lambda: self.make_val(self.memory[arr.base].type,
-                             self.memory[arr.base].array[idx + arr.offset]))))))
+
+       #     .kassert(lambda: is_pointer_type(idx) != is_pointer_type(arr), "Exactly one must be an address"))
+       #     # TODO: this is an example of why everything should be lambdas. we can't actually
+       #     # print idx before this
+       #     .if_(is_pointer_type(idx), lambda: self.k.passthrough(lambda: idx.value).passthrough(lambda: arr.value))
+       #     .else_(lambda: self.k.passthrough(lambda: arr.value).passthrough(lambda: idx.value))))
+
+       # .expect(lambda arr: self.k.expect(lambda idx:
+       #     self.k
+       #     .kassert(lambda: idx + arr.offset < self.memory[arr.base].len,
+       #         'Out of bounds array:{} idx:{} length:{}'.format(arr.base, idx, self.memory[arr.base].len))
+       #     .if_(self.context[-1] == 'lvalue',
+       #         lambda: self.k
+       #         .kassert(lambda: self.memory[arr.base].segment not in ['rodata', 'text', 'NULL'],
+       #                  self.memory[arr.base].segment)
+       #         .passthrough(lambda: lambda val:
+       #             self.update_memory(arr.base, idx+arr.offset, val)))
+       #     .else_(lambda: self.k
+       #         .passthrough(lambda: self.make_val(self.memory[arr.base].type,
+       #                      self.memory[arr.base].array[idx + arr.offset]))))))
 
     def visit_Assignment(self, n):
         # TODO: handle others
@@ -457,22 +339,15 @@ class Interpreter(object):
             .push_context('rvalue')
             .visit(n.rvalue)
             .expect(lambda val: self.k
+                # XXX XXX XXX
+                .side_effect('update', 'variable', n.op))
                 # assignments return the value of the assignment
                 # TODO: handle more than just these cases
-                .if_(n.op == '=', lambda: self.k.apply(lambda: assignment_op(val)).passthrough(lambda: val))
-                # not really an rvalue, but we need it
-                .else_(lambda: self.k.visit(n.lvalue).expect(lambda lval: self.k
-                    .apply(lambda: assign_helper(lval, val, assignment_op)))))
+                #.if_(n.op == '=', lambda: self.k.apply(lambda: assignment_op(val)).passthrough(lambda: val))
+                ## not really an rvalue, but we need it
+                #.else_(lambda: self.k.visit(n.lvalue).expect(lambda lval: self.k
+                #    .apply(lambda: assign_helper(lval, val, assignment_op)))))
             .pop_context()))
-
-    def visit_Cast(self, n):
-        # TODO: validate
-        (self.k.info(n)
-        .visit(n.to_type)
-        .expect(lambda type_: self.k
-            .visit(n.expr).expect(lambda val:
-                self.k.passthrough(lambda: self.make_val(type_, val.value)))))
-
 
     def visit_BinaryOp(self, n):
         assert n.op in binops
@@ -480,23 +355,24 @@ class Interpreter(object):
         # TODO cast to c type nonsense
         (self.k.info(n)
         .visit(n.left)
-        .expect(lambda lval:
-            self.k
-            .if_(n.op == '&&' and not lval.value, lambda: self.k
-                .passthrough(lambda: self.make_val(['_Bool'], 0)))
-            .elseif(n.op == '||' and lval.value, lambda: self.k
-                .passthrough(lambda: self.make_val(['_Bool'], 1)))
-            .else_(lambda: self.k
-                .visit(n.right)
-                .expect(lambda rval: self.k
-                    .apply(lambda: self.implicit_cast(lval, rval))
-                    .expect(lambda lval: self.k.expect(lambda rval: self.k
-                        .kassert(lambda: n.op != '%' or is_int_type(lval.type), lval.type)
-                        .kassert(lambda: n.op != '%' or rval != 0, "Can't mod by zero")
-                        .kassert(lambda: n.op != '/' or rval != 0, "Can't divide by zero")
-                        .passthrough(lambda: binops[n.op](lval.type))
-                        .expect(lambda typeval: self.k.passthrough(
-                            lambda: self.make_val(typeval[0], typeval[1](lval.value, rval.value))))))))))
+        .expect(lambda lval: self.k
+            # XXX XXX XXX XXX XXX
+        ))
+            #.if_(n.op == '&&' and not lval.value, lambda: self.k
+            #    .passthrough(lambda: self.make_val(['_Bool'], 0)))
+            #.elseif(n.op == '||' and lval.value, lambda: self.k
+            #    .passthrough(lambda: self.make_val(['_Bool'], 1)))
+            #.else_(lambda: self.k
+            #    .visit(n.right)
+            #    .expect(lambda rval: self.k
+            #        .apply(lambda: self.implicit_cast(lval, rval))
+            #        .expect(lambda lval: self.k.expect(lambda rval: self.k
+            #            .kassert(lambda: n.op != '%' or is_int_type(lval.type), lval.type)
+            #            .kassert(lambda: n.op != '%' or rval != 0, "Can't mod by zero")
+            #            .kassert(lambda: n.op != '/' or rval != 0, "Can't divide by zero")
+            #            .passthrough(lambda: binops[n.op](lval.type))
+            #            .expect(lambda typeval: self.k.passthrough(
+            #                lambda: self.make_val(typeval[0], typeval[1](lval.value, rval.value))))))))))
 
 
         # TODO: only currently supported pointer math is between a pointer for addition and subtraction,
@@ -531,36 +407,43 @@ class Interpreter(object):
         #    val = (add_back, val)
         #return type_, val
 
-
     def visit_Break(self, n):
         #TODO assert continuation['break'] is not None, 'Break in of invalid context'
         self.k.info(n).passthrough(lambda: Flow('Break'))
 
+    def visit_Cast(self, n):
+        # TODO: validate
+        (self.k.info(n)
+        .visit(n.to_type)
+        .expect(lambda type_: self.k
+            .visit(n.expr).expect(lambda val:
+                # either we can let the cast go through automatically, and only complain that it was invalid
+                # when it gets used, or complain immediately upon casting. In the latter case, it's a side effect
+                self.k.passthrough(lambda: self.k.side_effect('cast', type_, val)))))
+
     def visit_Compound(self, n):
         # TODO: do we actually ever even care to stop on this node?
         (self.k.info(n)
-        .loop_var(n.block_items)
-        # TODO: can't use loop, since we need to shortcut
-        .loop((lambda stmt:
-            self.k
-            .visit(stmt)
+        .loop(n.block_items, lambda stmt:
+            self.k.visit(stmt)
             .expect(lambda flow:
                 self.k
                 .if_(isinstance(flow, Flow) and flow.type != 'Normal', lambda: self.k
-                    # pass through to the looper to determine whether we should shortcircuit
-                    .passthrough(lambda: True).passthrough(lambda: flow))
-                .else_(lambda: self.k
-                    .passthrough(lambda: False).passthrough(lambda: Flow('Normal'))))), shortcircuit=True)
+                    # pass through to the looper that we should shortcircuit
+                    .passthrough(lambda: (True, flow)))
+                .else_(lambda: self.k.passthrough(lambda: (False, Flow('Normal'))))), shortcircuit=True)
         .expect(lambda flows:
-            self.k.passthrough(lambda: Flow('Normal', None) if isinstance(flows[-1], Val) else flows[-1])))
+            #self.k.passthrough(lambda: Flow('Normal', None) if isinstance(flows[-1], Val) else flows[-1])))
+            self.k.passthrough(lambda: Flow('Normal', None) if not isinstance(flows[-1], Flow) else flows[-1])))
 
     def visit_Constant(self, n):
         # TODO: necessary to expand the type??
-        self.k.info(n)
-        if not is_string_type(n.type):
-            self.k.passthrough(lambda: self.make_val([n.type], cast_to_python_val(self.make_val([n.type], n.value))))
-        else:
-                self.handle_string_const(n.value)
+        (self.k.info(n)
+        .side_effect('handle_constant', n.type, n.value))
+        #if not is_string_type(n.type):
+        #    self.k.passthrough(lambda: self.make_val([n.type], cast_to_python_val(self.make_val([n.type], n.value))))
+        #else:
+        #        self.handle_string_const(n.value)
 
     def visit_Continue(self, n):
         #assert continuations['continue'] is not None, 'Continue in invalid context'
@@ -571,7 +454,7 @@ class Interpreter(object):
     # quals: list of qualifiers (const, volatile)
     # funcspec: list function specifiers (i.e. inline in C99)
     # storage: list of storage specifiers (extern, register, etc.)
-    # type: declaration type (probably nested with all the modifiers)
+    # type : declaration type (probably nested with all the modifiers)
     # init: initialization value, or None
     # bitsize: bit field size, or None
     def decl_helper(self, n, type_):
@@ -588,9 +471,10 @@ class Interpreter(object):
                 .pop_context()
                 # TODO: validate the type
                 .expect(lambda val: self.k
-                    .apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, val.value)))))
-            .else_(lambda: self.k.apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, None)))))
-        .passthrough(lambda: Flow('Normal')))
+                    .apply(lambda: self.state_change('declare', 'variable', n.name, type_, val.value))))
+            .else_(lambda: self.k.apply(lambda: self.state_change('declare', 'variable', n.name, type_, None)))))
+        # XXX XXX XXX *shouldn't* pass flow, becasue of structs
+        #.passthrough(lambda: Flow('Normal')))
 
     def visit_Decl(self, n):
         # TODO: can n.type ever be None? only for funcdecl?
@@ -600,8 +484,7 @@ class Interpreter(object):
 
     def visit_DeclList(self, n):
         (self.k.info(n)
-        .loop_var(n.decls)
-        .loop(lambda decl:
+        .loop(n.decls, lambda decl:
             self.k.visit(decl)))
         # we want the decls to pass through. Like for a struct's decls
         #.expect(lambda decls: None)
@@ -609,36 +492,14 @@ class Interpreter(object):
 
     def visit_ExprList(self, n):
         (self.k.info(n)
-        .loop_var(n.exprs)
-        .loop(lambda expr: self.k.visit(expr)))
+        .loop(n.exprs, lambda expr: self.k.visit(expr)))
 
-    def visit_ID(self, n):
-        def helper():
-            for i in range(len(self.scope[-1])-1, -1, -1):
-                if n.name in self.scope[-1][i]:
-                    self.k.passthrough(lambda: i)
-                    return
-            else:
-                (self.k
-                .kassert(lambda: not self.require_decls, 'Undeclared identifier: ' + n.name)
-                .passthrough(lambda: -1))
-
-        (self.k.info(n)
-        .apply(helper)
-        .expect(lambda scope:
-            self.k
-            .if_(self.context[-1] == 'lvalue', lambda: self.k
-                .passthrough(lambda: lambda val: self.update_scope(n.name, val, scope)))
-            .else_(lambda: self.k
-                .kassert(lambda: self.scope[-1][scope][n.name].value is not None, "Uninitialized variable")
-                .passthrough(lambda: self.scope[-1][scope][n.name]))))
-
+    # top-level node
     def visit_FileAST(self, n):
         # TODO: put global map placement in here??
         (self.k.info(n)
-        .loop_var(n.ext)
-        .loop(lambda ext: self.k.visit(ext))
-        # don't really care about the return
+        .loop(n.ext, lambda ext: self.k.visit(ext))
+        # don't really care about the return.
         .expect(lambda exts: None))
 
     def visit_For(self, n):
@@ -665,7 +526,6 @@ class Interpreter(object):
                     .pop_scope()
                     .passthrough(lambda: Flow('Normal')))))
 
-
         # TODO: can we declare a variable in both for (int i) { int i; ??
         self.k.info(n)
         # TODO only do this if n.init exists??
@@ -686,57 +546,21 @@ class Interpreter(object):
         .expect(lambda name: self.k
             .if_(n.args, lambda: self.k.visit(n.args))
             .else_(lambda: self.k.passthrough(lambda: []))
-            .expect(lambda args: self.k
-                .if_(self.memory[name.value].type[0][0] == '(builtin)', lambda: self.k
-                    .apply(lambda: self.memory[name.value].array[0](args)))
-                .else_(lambda: self.k
-                    .kassert(lambda: self.memory[name.value].type[0][0] == '(user-defined)', 'blah3')
-                    # TODO: make these push_func_scope
-                    .apply(self.push_func_scope)
-                    .visit(self.memory[name.value].array[0])
-                    .apply(self.pop_func_scope)
-                    # TODO: check return type
-                    .expect(lambda flow:
-                        self.k
-                        .kassert(lambda: flow.type == 'Return', 'Didn\'t return from FuncCall')
-                        .passthrough(lambda: flow.value))))))
+            .expect(lambda args: self.k.side_effect('call', 'memory', name.value, args))))
 
-
-
-    def visit_Typedef(self, n):
-        # TODO: quals, storage, etc.
-        (self.k.info(n).visit(n.type)
-        .expect(lambda type_: self.k
-            .apply(lambda: self.update_type(n.name, type_))
-            .passthrough(lambda: Flow('Normal'))))
-
-    def visit_TypeDecl(self, n):
-        self.k.info(n).visit(n.type)
-
-    def visit_ArrayDecl(self, n):
-        (self.k.info(n)
-        .visit(n.type)
-        .expect(lambda type_: self.k
-            .if_(n.dim, lambda: self.k.visit(n.dim).expect(lambda dim: self.k.passthrough(lambda: str(dim.value))))
-            .else_(lambda: self.k.passthrough(lambda: ''))
-            .expect(lambda dim: self.k.passthrough(lambda: ['[' + dim + ']'] + type_))))
-
-
-    def visit_IdentifierType(self, n):
-        self.k.info(n).passthrough(lambda: n.names)
-
-    def visit_ParamList(self, n):
-        # TODO: can param.name be empty?
-        # TODO: ellipsisparam should only go at the end
-        (self.k.info(n)
-        .loop_var(n.params)
-        .loop(lambda param:
-            self.k
-            .if_(isinstance(param, c_ast.EllipsisParam), lambda:
-                self.k.passthrough(lambda: ('...', None)))
-            .else_(lambda: self.k
-                .visit(param.type)
-                .expect(lambda ptype: self.k.passthrough(lambda: (param.name, ptype))))))
+                #.if_(self.memory[name.value].type[0][0] == '(builtin)', lambda: self.k
+                #    .apply(lambda: self.memory[name.value].array[0](args)))
+                #.else_(lambda: self.k
+                #    .kassert(lambda: self.memory[name.value].type[0][0] == '(user-defined)', 'blah3')
+                #    # TODO: make these push_func_scope
+                #    .apply(self.push_func_scope)
+                #    .visit(self.memory[name.value].array[0])
+                #    .apply(self.pop_func_scope)
+                #    # TODO: check return type
+                #    .expect(lambda flow:
+                #        self.k
+                #        .kassert(lambda: flow.type == 'Return', 'Didn\'t return from FuncCall')
+                #        .passthrough(lambda: flow.value))))))
 
     def visit_FuncDecl(self, n):
         # only the funcdef funcdecl will necessarily have parameter names
@@ -750,21 +574,25 @@ class Interpreter(object):
                     [param[0] for param in params],
                     [param[1] for param in params])]))))
 
-        # TODO: typedefs should be scoped
-        #continuation.passthrough(lambda k:
-        #    lambda ret_type: lambda params:
-        #    expand_type([('(user-defined)', ret_type, params[0], params[1])], self.typedefs, k))
-
-
-
     def visit_FuncDef(self, n):
         # TODO: check against prior funcdecls?
         (self.k.info(n)
         .visit(n.decl)
         .expect(lambda val:
-            self.k.apply(lambda: self.memory_init(n.decl.name, val.type, 1, [n.body], 'text')))
+            self.k.side_effect('allocate', 'memory', n.decl.name, val.type, 1, [n.body], 'text'))
+            #self.k.apply(lambda: self.memory_init(n.decl.name, val.type, 1, [n.body], 'text')))
         .passthrough(lambda: Flow('Normal')))
 
+
+    def visit_ID(self, n):
+        (self.k.info(n)
+        .if_(self.context[-1] == 'lvalue', lambda: self.k
+            .passthrough(lambda: lambda val: self.k.side_effect('update', 'variable', n.name, val)))
+        .else_(lambda: self.k
+            .passthrough(lambda: self.k.side_effect('get', 'variable', n.name))))
+
+    def visit_IdentifierType(self, n):
+        self.k.info(n).passthrough(lambda: n.names)
 
     def visit_If(self, n):
         self.k.info(n)
@@ -779,29 +607,41 @@ class Interpreter(object):
             # generate Flow for this block
             .else_(lambda: self.k.passthrough(lambda: Flow('Normal'))))
 
+    def visit_ParamList(self, n):
+        # TODO: can param.name be empty?
+        # TODO: ellipsisparam should only go at the end
+        (self.k.info(n)
+        .loop(n.params, lambda param:
+            self.k
+            .if_(isinstance(param, c_ast.EllipsisParam), lambda:
+                self.k.passthrough(lambda: ('...', None)))
+            .else_(lambda: self.k
+                .visit(param.type)
+                .expect(lambda ptype: self.k.passthrough(lambda: (param.name, ptype))))))
+
+
     def visit_PtrDecl(self, n):
         (self.k.info(n)
         .visit(n.type)
-        .expect(lambda type_: self.k.passthrough(lambda: ['*'] + type_)))
+        .expect(lambda type_: self.k.passthrough(lambda: type_ + ['*'])))
 
-    def visit_Union(self, n):
-        # TODO: finish this
-        (self.k.info(n)
-        .loop_var(n.decls)
-        .loop(lambda decl: self.k.visit(decl))
-        .expect(lambda decls: self.k
-            .apply(lambda: operator.setitem(self.structs, n.name, decls))
-            .passthrough(lambda: [Struct(n.name, decls)])))
+    def visit_Return(self, n):
+        self.k.info(n)
+        if n.expr: self.k.visit(n.expr)
+        # TODO: we very explicitly want this to pass through to self.k.expect, not to the upper continuation
+        else: self.k.passthrough(lambda: None)
+        self.k.expect(lambda val: self.k.passthrough(lambda: Flow('Return', val)))
+
+        # TODO: can we even write a return outside of a function?
+        # TODO: we need to check this elsewhere
+        #assert continuations['return'] is not None, 'Return in invalid context'
 
     def visit_Struct(self, n):
+        # TODO: strong copy-paste between this and union
         # TODO: finish this
         (self.k.info(n)
-        .loop_var(n.decls)
-        .loop(lambda decl: self.k.visit(decl))
-        .expect(lambda decls: self.k
-            .apply(lambda: operator.setitem(self.structs, n.name, decls))
-            .passthrough(lambda: [Struct(n.name, decls)])))
-        # TODO do something with memory
+        .loop(n.decls, lambda decl: self.k.visit(decl))
+        .expect(lambda decls: self.k.side_effect('allocate', 'struct', n.name, decls)))
 
     # Like if, but returns the Val instead of the Flow.
     # TODO:shouldn't it disallow
@@ -812,6 +652,15 @@ class Interpreter(object):
         .expect(lambda cond: self.k
             .if_(cond.value, lambda: self.k.visit(n.iftrue))
             .else_(lambda: self.k.visit(n.iffalse))))
+
+    def visit_TypeDecl(self, n):
+        self.k.info(n).visit(n.type)
+
+    def visit_Typedef(self, n):
+        # TODO: quals, storage, etc.
+        (self.k.info(n).visit(n.type)
+        .expect(lambda type_: self.k
+            .apply(lambda: self.k.side_effect('declare', 'typedef', n.name, type_))))
 
     def visit_Typename(self, n):
         # TODO: stuff with n.quals
@@ -865,6 +714,11 @@ class Interpreter(object):
 
         self.k.info(n).visit(n.expr).expect(helper)
 
+    def visit_Union(self, n):
+        # TODO: finish this
+        (self.k.info(n)
+        .loop(n.decls, lambda decl: self.k.visit(decl))
+        .expect(lambda decls: self.k.side_effect('allocate', 'union', n.name, decls)))
 
     # TODO: detect infinite loop??
     def visit_While(self, n):
@@ -887,50 +741,3 @@ class Interpreter(object):
                         .passthrough(lambda: flow))))
             .else_(lambda: self.k.passthrough(lambda: Flow('Normal')))))
 
-
-
-
-    def visit_Return(self, n):
-        self.k.info(n)
-        if n.expr: self.k.visit(n.expr)
-        # TODO: we very explicitly want this to pass through to self.k.expect, not to the upper continuation
-        else: self.k.passthrough(lambda: None)
-        self.k.expect(lambda val: self.k.passthrough(lambda: Flow('Return', val)))
-
-        # TODO: can we even write a return outside of a function?
-        # TODO: we need to check this elsewhere
-        #assert continuations['return'] is not None, 'Return in invalid context'
-
-def preprocess_file(file_, is_code=False):
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    include_path = os.path.join(dir_path, 'clib/build/include')
-    cpp_args = [r'cpp', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
-                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=',
-                '-']
-    #cpp_args.append(file_ if not is_code else '-')
-
-    # reading from stdin
-    #proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
-    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
-    stdout, stderr = proc.communicate(bytes(file_, 'latin-1') if is_code else None)
-    stdout = stdout.decode('latin-1')
-    stderr = stderr.decode('latin-1')
-    if len(stderr) != 0:
-        print('Uh oh! Stderr messages', proc.stderr)
-    elif proc.returncode != 0:
-        print('Uh oh! Nonzero error code')
-    else:
-        return stdout
-
-# TODO: use getcwd for filename?
-def init_interpreter(file_, is_code=False):
-    parser = c_parser.CParser()
-    # TODO: need to check for errors
-    try:
-        cfile = preprocess_file(file_, is_code)
-        ast = parser.parse(cfile)
-    except Exception as e:
-        print('uh oh2', e)
-        sys.exit(1)
-
-    return Interpreter(ast)

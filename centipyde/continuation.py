@@ -1,8 +1,3 @@
-import sys
-import re
-import inspect
-from contextlib import contextmanager
-
 from inspect import signature, getmembers
 
 # TODO:figure out how to include column offset.
@@ -20,6 +15,7 @@ class Continuation(object):
     def __init__(self):
 
         self.continuations = []
+        self.reverse_k = []
         self.passthroughs = []
         self.loop_passthroughs = [[]]
         self.if_id = 0
@@ -72,107 +68,82 @@ class Continuation(object):
         self.continuations.append((self.handle_loop, [func, list_, shortcircuit, True]))
         return self
 
-    # TODO: figure out how context_num works here??? Is it needed?
-    def handle_loop(self, func, list_, shortcircuit, first):
-        loop_vars = self.loop_passthroughs[-2][0]
-        do_shortcircuit = False
-        if not first:
-            # TODO: these *need* to be pushed immediately before, so should be at the end the loop...
-            val = self.get_passthrough(-1)
-            loop_vars[1].append(val)
-            if shortcircuit:
-                do_shortcircuit = self.get_passthrough(-1)
+    def handle_loop(self, is_forward, func, shortcircuit, items, old_items, results):
+        if is_forward:
+            do_shortcircuit = False
 
-        if len(loop_vars[0]) == 0 or do_shortcircuit:
-            self.loop_passthroughs.pop()
-            self.loop_passthroughs.pop()
-            # TODO TODO: do we have to worry about a passthrough we're using being pulled out,
-            # such that this should go in front? that's impossible, right?
-            self.put_passthrough(lambda: loop_vars[1])
-            #if len(self.passthroughs[-1]) == 0 or self.passthroughs[-1][0][1] < context_num:
-            #    self.passthroughs[-1] = [(loop_vars[1], context_num)] + self.passthroughs[-1]
-            #else:
-            #    self.passthroughs[-1].append((loop_vars[1], context_num))
-            return
+            if len(old_items) != 0:
+                # this is not the first iteration of the loop
 
-        var = loop_vars[0].pop(0)
+                # don't use get_passthrough and put_passthrough, because those will do things that aren't quite what we
+                # want. They'd probably work, but information would be duplicated
+                assert len(self.passthroughs) == 1
+                val = self.passthroughs.pop(0)
+                results.append(val)
+                if shortcircuit:
+                    do_shortcircuit = val[0][0]
 
-        # This should add a continuation that we can now apply to get the element
-        # TODO: context can become huge, right??
-        # we want to revisit the loop eventually
-        tmp = func(var)
-        # handle list_
-        if list_:
-            tmp(loop_vars[1])
-        self.continuations.append((self.handle_loop, [func, list_, shortcircuit, False]))
+            if len(items) == 0 or do_shortcircuit:
+                vals = [(val[0][1] if shortcircuit else val[0]) for val in results]
+                self.passthroughs.append(vals)
+                return
 
-    def loop_var(self, var):
-        assert var is None or isinstance(var, list)
-        self.continuations.append((self.handle_loop_var, [var]))
-        return self
+            # this technically isn't a passthrough. maybe it should be...
+            item = items.pop(0)
+            old_items.append(item)
 
-    def handle_loop_var(self, var):
-        #assert(self.continuations[0][0] == self.handle_loop)
-        self.loop_passthroughs.append([])
-        if var is None:
-            # default return value is empty list
-            self.loop_passthroughs[-1].append([[],[]])
+            # This should add a continuation that we can then apply at the next step to complete one iteration
+            # of the loop
+            tmp = func(item)
+
+            # we want to revisit the loop eventually
+            self.continuations.append((self.handle_loop, [func, shortcircuit, items, old_items, results]))
         else:
-            # we don't want to use the original var, since then we'll pop things off
-            # the node
-            self.loop_passthroughs[-1].append([var.copy(),[]])
-        self.loop_passthroughs.append([])
+            if len(items) == 0 or (shortcircuit and len(results) > 0 and results[-1][0][0] == True):
+                # this was the last iteration of the loop. Remove the return value
+                self.passthroughs.pop()
+
+            if len(results) != 0:
+                self.passthroughs.insert(0, results.pop())
+
+            if len(old_items) != 0:
+                items.insert(0, old_items.pop())
+
 
     def passthrough(self, val):
         assert len(signature(val).parameters) == 0
         self.continuations.append((self.handle_passthrough, [val]))
         return self
 
-    def get_passthrough(self, idx=0):
-        val, func = self.passthroughs.pop(idx)
-        #print('Removing {} from idx {}, remaining {}, value generated at: '.format(
-        #    val, idx, self.passthroughs), end="")
-        #print_lambda(func)
-        return val
-
-    def put_passthrough(self, func):
-        #print_lambda(func)
-        val = func()
-        #print('adding', val, self.passthroughs, '\n')
-        # keep around the func so we know where a value was generated
-        self.passthroughs.append((val, func))
-
-    def handle_passthrough(self, func):
-        # TODO: the pushing context is only needed if we're passing through something that can add to
-        # the continuation. Generally no?
-        # TODO: will this only *ever* go at the front or the back?
-        self.put_passthrough(func)
+    # only ever appends
+    def handle_passthrough(self, is_forward, func):
+        self.put_passthrough(is_forward, func)
         # This is currently true for Return
         #assert ret is not None
 
     # TODO: this NEEDS to take a lambda, since free variables could get modified
     # that are in the condition (such as self.context)
-    def if_(self, cond, func):
+    def if_(self, is_forward, cond, func):
         assert len(signature(func).parameters) == 0
         self.if_id += 1
         self.continuations.append((self.handle_if, [cond, func, self.if_id]))
         return self
 
     def handle_if(self, cond, func, if_id):
+        if not is_forward: return
         if cond:
             func()
             # we only want to do this after the other continuations
             # from func() are executed. Not immediately!!
             self.apply(lambda: setattr(self, 'completed_if_id', if_id))
 
-    def elseif(self, cond, func):
+    def elseif(self, is_forward, cond, func):
         assert len(signature(func).parameters) == 0
         self.continuations.append((self.handle_elseif, [cond, func, self.if_id]))
         return self
 
-    def handle_elseif(self, cond, func, if_id):
-        # TODO: is the >= correct??????????????????????
-        # scoping with the continuations is weird...
+    def handle_elseif(self, is_forward, cond, func, if_id):
+        if not is_forward: return
         if self.completed_if_id != if_id and cond:
             func()
             self.apply(lambda: setattr(self, 'completed_if_id', if_id))
@@ -182,20 +153,11 @@ class Continuation(object):
         self.continuations.append((self.handle_else, [func, self.if_id]))
         return self
 
-    def handle_else(self, func, if_id):
+    def handle_else(self, is_forward, func, if_id):
+        if not is_forward: return
         # no need to set the completed_id, since we're the else anyway
         if self.completed_if_id != if_id:
             func()
-
-    #def pop_context(self):
-    #    c = self.continuations.pop()
-    #    p = self.passthroughs.pop()
-    #    self.continuations[-1] = c + self.continuations[-1]
-    #    # a context can only have one top-level passthrough, right?
-    #    # does anything else necessarily make sense?
-    #    # TODO: not necessarily true?
-    #    assert len(p) <= 1
-    #    self.passthroughs[-1] =  p + self.passthroughs[-1]
 
 
     def step(self):

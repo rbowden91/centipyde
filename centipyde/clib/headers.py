@@ -100,11 +100,11 @@ for root, dir_, files in os.walk(u'.'):
                 print("Couldn\'t parse file.", header, e)
 
         # now we want to collect macro definition information
-        defines = preprocess_file(header, cpp_path='clang', cpp_args=['-E', '-dM'] + cpp_args).split('\n')
-        for line in cfile.split('\n'):
-            print(line)
-            if line.startswith('#define'):
-                print(line)
+        #defines = preprocess_file(header, cpp_path='clang', cpp_args=['-E', '-dM'] + cpp_args).split('\n')
+        #for line in cfile.split('\n'):
+        #    print(line)
+        #    if line.startswith('#define'):
+        #        print(line)
 
 print(header_info.typedefs)
         #stdout = preprocess_file(header, cpp_path='clang', cpp_args=[r'-E', r'-dM'] + cpp_args)
