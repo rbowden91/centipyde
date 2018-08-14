@@ -1,7 +1,7 @@
 from typing import Any
 import operator
 
-from .c_values import CAddress, CVal, CFunction
+from .c_values import Address, Val, Function
 
 
 class GetString(CFunction):
@@ -23,6 +23,7 @@ class GetString(CFunction):
         self.allocation_list.append(name)
         return self.env.make_val(['string'], Address(name, 0))
 
+    # TODO?
     #def __del__(self):
     #    [env.deallocate_memory(name) for name in self.allocation_list]
 

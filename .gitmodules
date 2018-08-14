@@ -4,6 +4,3 @@
 [submodule "clib/musl"]
 	path = centipyde/clib/musl
 	url = git://git.musl-libc.org/musl
-[submodule "virpy"]
-	path = centipyde/virpy
-	url = git@github.com:rbowden91/virpy.git

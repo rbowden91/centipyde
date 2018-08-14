@@ -1,5 +1,4 @@
-# TODO: is there some kind of generator-based approach we could take instead?? Would we then lose the ability to take
-# out the generators by using the ast trick?
+# Can't use generators, because then we can't readily reverse?
 import sys
 import os
 import subprocess
@@ -11,41 +10,17 @@ from .crt import CRuntime
 from .continuation import Continuation
 
 
-# This only knows about "flows". No other values are really relevant
-
-class Flow(object):
-    __slots__ = ['type', 'value']
-    def __init__(self, type_, value=None):
-        self.type = type_
-        self.value = value
-
-    def __str__(self):
-        return 'Flow(' + str(self.type) + ', ' + str(self.value) + ')'
-
-    def __repr__(self):
-        return str(self)
-
-    def to_dict(self):
-        return {
-            'class': 'Flow',
-            'type': self.type,
-            'value': self.value,
-        }
 
 def preprocess_file(file_, is_code=False):
     dir_path = os.path.dirname(os.path.realpath(__file__))
     include_path = os.path.join(dir_path, 'clib/build/include')
     cpp_args = [r'cpp', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
-                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=',
-                '-']
-    #cpp_args.append(file_ if not is_code else '-')
+                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=']
+    cpp_args.append(file_ if not is_code else '-')
 
     # reading from stdin
-    #proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
-    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
     stdout, stderr = proc.communicate(bytes(file_, 'latin-1') if is_code else None)
-    stdout = stdout.decode('latin-1')
-    stderr = stderr.decode('latin-1')
     if len(stderr) != 0:
         print('Uh oh! Stderr messages', proc.stderr)
     elif proc.returncode != 0:
@@ -230,6 +205,26 @@ class InterpContinuation(Continuation):
     # passed through?
     # okay I actually did this, but it's not helpful for things pulled from memory. Remember in
     # memory the origin of a value??
+
+# This only knows about "flows". No other values are really relevant
+class Flow(object):
+    __slots__ = ['type', 'value']
+    def __init__(self, type_, value=None):
+        self.type = type_
+        self.value = value
+
+    def __str__(self):
+        return 'Flow(' + str(self.type) + ', ' + str(self.value) + ')'
+
+    def __repr__(self):
+        return str(self)
+
+    def to_dict(self):
+        return {
+            'class': 'Flow',
+            'type': self.type,
+            'value': self.value,
+        }
 
 class Interpreter(object):
     # TODO: pass require_decls through to cwrapper

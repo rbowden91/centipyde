@@ -1,19 +1,10 @@
 import ctypes
+import operator
 
-# TODO: rename this file. way too close to "ctypes"
+from abc import ABCMeta
+from typing import NewType, List, Optional, Tuple, Union, Type
 
-# TODO: evidently, something like "unsigned x", where x is typedefed to int, isn't allowed
 
-# TODO: too many casting rules...
-# https://www.safaribooksonline.com/library/view/c-in-a/0596006977/ch04.html
-
-# TODO: such a thing as unsigned _Bool?
-int_types = set(['_Bool'])
-for t in ['char', 'short', 'int', 'long', 'long long']:
-    int_types.add(t)
-    # TODO: should this be a list? then can't put it into a set...
-    int_types.add('unsigned ' + t)
-float_types = set(['float', 'double', 'long double'])
 
 python_type_map = {
     '_Bool': ctypes.c_bool,
@@ -123,56 +114,56 @@ def is_void_function(type_):
     return type_[0][1] == 'void'
 
 
-unops = {
-   '+': operator.pos,
-   '-': operator.neg,
-   '~': operator.inv,
-   '!': operator.not_,
-}
-
-unops['sizeof'] = lambda: assert_false("TODO")
-# shouldn't call these directly, since they require accessing memory/locals
-for k in ['*', '&', 'p++', '++p', 'p--', '--p']:
-    unops[k] = lambda: assert_false("Shouldn't call these unops")
-
-def boolean_and(lval):
-    return lambda rval: rval
-
-def boolean_or(lval):
-    return lambda rval: rval
-
-# TODO: check results for overflow???
-binops = {
-    '+': operator.add,
-    '-': operator.sub,
-    '*': operator.mul,
-    # TODO: division by zero runtime error
-    #'/': lambda type_: (type_, (operator.truediv if is_float_type(type_) else operator.floordiv)),
-    # TODO: assert something about type_ being int,
-    '%': operator.mod,
-
-    '|': operator.or_,
-    '&': operator.and_,
-    '^': operator.xor,
-    '<<': operator.lshift,
-    # TODO: something with unsigned right shift??,
-    '>>': operator.rshift,
-
-    # TODO: any issues with falsiness?,
-    # TODO: what type does a boolean comparison return?,
-    # TODO: these are returning True instead of 1
-    '==': operator.eq,
-    '!=': operator.neq,
-    '<': operator.lt,
-    '<=': operator.le,
-    '>': operator.gt,
-    '>=': operator.ge,
-
-    # && and || are special, because they can short circuit. By the time we call this function, short-circuiting
-    # should already have been checked for
-    '&&': boolean_and,
-    '||': boolean_or
-}
+#unops = {
+#   '+': operator.pos,
+#   '-': operator.neg,
+#   '~': operator.inv,
+#   '!': operator.not_,
+#}
+#
+#unops['sizeof'] = lambda _: assert_false("TODO")
+## shouldn't call these directly, since they require accessing memory/locals
+#for k in ['*', '&', 'p++', '++p', 'p--', '--p']:
+#    unops[k] = lambda _: assert_false("Shouldn't call these unops")
+#
+#def boolean_and(lval):
+#    return lambda rval: rval
+#
+#def boolean_or(lval):
+#    return lambda rval: rval
+#
+## TODO: check results for overflow???
+#binops = {
+#    '+': operator.add,
+#    '-': operator.sub,
+#    '*': operator.mul,
+#    # TODO: division by zero runtime error
+#    #'/': lambda type_: (type_, (operator.truediv if is_float_type(type_) else operator.floordiv)),
+#    # TODO: assert something about type_ being int,
+#    '%': operator.mod,
+#
+#    '|': operator.or_,
+#    '&': operator.and_,
+#    '^': operator.xor,
+#    '<<': operator.lshift,
+#    # TODO: something with unsigned right shift??,
+#    '>>': operator.rshift,
+#
+#    # TODO: any issues with falsiness?,
+#    # TODO: what type does a boolean comparison return?,
+#    # TODO: these are returning True instead of 1
+#    '==': operator.eq,
+#    '!=': operator.neq,
+#    '<': operator.lt,
+#    '<=': operator.le,
+#    '>': operator.gt,
+#    '>=': operator.ge,
+#
+#    # && and || are special, because they can short circuit. By the time we call this function, short-circuiting
+#    # should already have been checked for
+#    '&&': boolean_and,
+#    '||': boolean_or
+#}
 
 #            .if_(n.op == '&&' and not lval.value, lambda: self.k
 #                .passthrough(lambda: self.make_val(['_Bool'], 0)))
