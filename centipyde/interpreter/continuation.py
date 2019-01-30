@@ -174,3 +174,7 @@ class Continuation(object):
             ret = k[0](*k[1])
             self.continuations = self.continuations + old_continuations
         return ret
+
+    # TODO
+    def revstep(self):
+        return None

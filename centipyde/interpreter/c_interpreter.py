@@ -1,47 +1,15 @@
-# Can't use generators, because then we can't readily reverse?
-import sys
-import os
-import subprocess
-
 # TODO: eventually handle this. pycparser doesn't play nicely with mypy yet
 from pycparser import c_ast, c_parser # type: ignore
 
-from .crt import CRuntime
+from ..c_runtime import CRuntime
 from .continuation import Continuation
+from .flow import Flow
 
 
-
-def preprocess_file(file_, is_code=False):
-    dir_path = os.path.dirname(os.path.realpath(__file__))
-    include_path = os.path.join(dir_path, 'clib/build/include')
-    cpp_args = [r'cpp', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
-                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=']
-    cpp_args.append(file_ if not is_code else '-')
-
-    # reading from stdin
-    proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
-    stdout, stderr = proc.communicate(bytes(file_, 'latin-1') if is_code else None)
-    if len(stderr) != 0:
-        print('Uh oh! Stderr messages', proc.stderr)
-    elif proc.returncode != 0:
-        print('Uh oh! Nonzero error code')
-    else:
-        return stdout
-
-# TODO: use getcwd for filename?
-def init_interpreter(file_, is_code=False):
-    parser = c_parser.CParser()
-    # TODO: need to check for errors
-    try:
-        cfile = preprocess_file(file_, is_code)
-        ast = parser.parse(cfile)
-    except Exception as e:
-        print('uh oh2', e)
-        sys.exit(1)
-
-    return Interpreter(ast)
 
 # TODO: cache results from particularly common subtrees?
+
+# Can't use generators, because then we can't readily reverse
 
 # Make this a subclass, so the Continuation module doesn't need to know anything about
 # Interpreters. This is mostly just convenience methods.
@@ -206,32 +174,11 @@ class InterpContinuation(Continuation):
     # okay I actually did this, but it's not helpful for things pulled from memory. Remember in
     # memory the origin of a value??
 
-# This only knows about "flows". No other values are really relevant
-class Flow(object):
-    __slots__ = ['type', 'value']
-    def __init__(self, type_, value=None):
-        self.type = type_
-        self.value = value
-
-    def __str__(self):
-        return 'Flow(' + str(self.type) + ', ' + str(self.value) + ')'
-
-    def __repr__(self):
-        return str(self)
-
-    def to_dict(self):
-        return {
-            'class': 'Flow',
-            'type': self.type,
-            'value': self.value,
-        }
-
-class Interpreter(object):
+class CInterpreter(object):
     # TODO: pass require_decls through to cwrapper
-    def __init__(self, ast, require_decls=True):
+    def __init__(self, ast:c_ast.Node, crt:CRuntime):
         # If false, we don't require type declarations before assigning to a variable (unlike regular C)
-        self.require_decls = require_decls
-
+        self.crt = crt
         self.ast = ast
         self.k = InterpContinuation(self)
 
@@ -240,13 +187,12 @@ class Interpreter(object):
         self.context = ['global']
 
         # read in all the typedefs, funcdefs, globals, etc.
-        # this is effectively "compiling", but only by looking at top-level things
-        # TODO: Probably need to make explicit the iteration over globals
-        self.runtime = CRuntime(require_decls)
+        # this is effectively "compiling", but only top-level things
+        # TODO: Probably need to make explicit the iteration over globals, for visualization purposes
         self.visit(ast)
         self.run()
 
-        # so that we don't have to directly access the continuation
+        # so that things that use the interpreter don't have to directly know about the continuation implementation
         self.step = self.k.step
         self.revstep = self.k.revstep
 
@@ -264,6 +210,7 @@ class Interpreter(object):
                 break
         # get the return value and store it in interpreter here?
 
+    # XXX ROB: I don't remember what this means
     # We don't really need the caching anymore that pycparser uses, since we no longer visit nodes multiple times
     def visit(self, node):
         #node.show(showcoord=True)
@@ -541,7 +488,7 @@ class Interpreter(object):
         .expect(lambda name: self.k
             .if_(n.args, lambda: self.k.visit(n.args))
             .else_(lambda: self.k.passthrough(lambda: []))
-            .expect(lambda args: self.k.side_effect('call', 'memory', name.value, args))))
+            .expect(lambda args: self.k.call_function(name.value, args))))
 
                 #.if_(self.memory[name.value].type[0][0] == '(builtin)', lambda: self.k
                 #    .apply(lambda: self.memory[name.value].array[0](args)))
@@ -574,7 +521,7 @@ class Interpreter(object):
         (self.k.info(n)
         .visit(n.decl)
         .expect(lambda val:
-            self.k.side_effect('allocate', 'memory', n.decl.name, val.type, 1, [n.body], 'text'))
+            self.k.new_function(n.decl.name, val.type, n.body))
             #self.k.apply(lambda: self.memory_init(n.decl.name, val.type, 1, [n.body], 'text')))
         .passthrough(lambda: Flow('Normal')))
 
@@ -582,9 +529,9 @@ class Interpreter(object):
     def visit_ID(self, n):
         (self.k.info(n)
         .if_(self.context[-1] == 'lvalue', lambda: self.k
-            .passthrough(lambda: lambda val: self.k.side_effect('update', 'variable', n.name, val)))
+            .passthrough(lambda: lambda val: self.k.write_memory(n.name, val)))
         .else_(lambda: self.k
-            .passthrough(lambda: self.k.side_effect('get', 'variable', n.name))))
+            .passthrough(lambda: self.k.read_memory(n.name))))
 
     def visit_IdentifierType(self, n):
         self.k.info(n).passthrough(lambda: n.names)

@@ -2,11 +2,11 @@
 from enum import Enum, auto
 from typing import Dict, List, Tuple, Callable, Optional, Generic, TypeVar, Union, Optional, Type
 
-from .cwrapper import LibCWrapper
-from .c_values import *
-from .interpret import Interpreter
-from .c_memory import CMemory
-
+from .libc.libc_abc import LibCWrapper
+from .values.c_values import *
+from .interpreter.c_interpreter import CInterpreter
+from .memory.c_memory import CMemory
+from pycparser import c_ast # type:ignore
 
 # TODO: anything that modifies memory we might want to manually implement to check for aliasing or what not?
 # TODO: malloc definitely needs to be done ourselves, right?
@@ -16,31 +16,73 @@ from .c_memory import CMemory
 # TODO: can a typedef happen before the base type exists?? forward declarations?
 # TODO: complain about unused/various warnings?
 
-class CStds(Enum):
+class CStd(Enum):
     #k_and_r = auto()
     #ansi = iso = c89 = c90 = auto()
     c99 = auto()
     c11 = auto()
 
+class FileMode(Enum):
+    append = auto()
+    write = auto()
+    read = auto()
+
+class FileInstance(object):
+    def __init__(self, mode:FileMode, fileno:int) -> None:
+        self.refcount = 1
+        self.offset = 0
+        self.fileno = fileno
+        self.mode = mode
+
+class File(object):
+    fileno_ctr : int = 1
+
+    def __init__(self) -> None:
+        self.fileno = File.fileno_ctr
+        File.fileno_ctr += 1
+        self.refcount = 1
+
+class Console(File):
+    def __init__(self) -> None:
+        File.__init__(self)
+        self.log : List[bytes] = []
+
+    def read(self) -> bytes:
+        return 'blah\n'.encode()
+
+    def write(self, data:bytes) -> int:
+        return 0
+
+
 class CRuntime(object):
-    def __init__(self, interpreter : Interpreter, require_decls:bool = True) -> None:
-        self.c_std : CStds = CStds.c99
+    def __init__(self, code:c_ast.Node, require_decls:bool = True, c_std:CStd = CStd.c99) -> None:
+        self.c_std = c_std
 
         # values are tuples of type, num_elements, and array of elements
         # we might want something like this so that we can
         #self.identifiers = CIdentifiers()
         self.memory = CMemory()
-        self.stdio = {
-            'stdin': '',
-            'stdout': '',
-            'stderr': ''
+
+        console = Console()
+
+        self.files : Dict[int, File] = {
+            console.fileno: console
         }
-#CStdio()
-        #self.filesystem = CFilesystem()
+
+        self.filesystem : Dict[str, File] = {
+            '<con>': console
+        }
+        self.file_descriptors = {
+            0: FileInstance(FileMode.read, console.fileno),
+            1: FileInstance(FileMode.write, console.fileno),
+            # TODO: doesn't distinguish stderr
+            2: FileInstance(FileMode.write, console.fileno)
+        }
 
         self.libc = LibCWrapper()
+
         # self.libc.funcs
-        self.interpreter = interpreter
+        self.interpreter = CInterpreter(self, code)
 
 
 #    def allocate_memory(self, name, type_, len_, array, segment):
@@ -121,7 +163,6 @@ class CRuntime(object):
         return array2
         #segment.finalize()
 
-    # this is basically our elf loader, lol
     def setup_main(self, argv : List[bytearray] = [], envp : List[bytearray] = []):
 
         # TODO: need to reset global variables to initial values as well
@@ -142,14 +183,19 @@ class CRuntime(object):
         new_envp = self.setup_array('envp', envp)
 
         # call function, automatically wrap into vals
-        main = self.memory.get(('text', 'main', None))
+        main = self.memory.get('main')
+        # TODO: typecheck main / handle "void", etc.
+        assert isinstance(main, CFunction)
+
         self.call_func(main, (argc, argv))
 
     def call_func(self, func, args):
-        self.memory.stack.do_push_func_scope()
-        self.memory.stack.do_push_scope()
+        self.memory.do_push_func_scope()
+        self.memory.do_push_scope()
+        #self.memory.stack[-1]
+
         # call function, automatically wrap into vals
         self.call_func(func, args)
 
-        self.memory.stack.do_pop_scope() # not particularly necessary
-        self.memory.stack.do_pop_func_scope()
+        self.memory.do_pop_scope() # not particularly necessary
+        self.memory.do_pop_func_scope()
