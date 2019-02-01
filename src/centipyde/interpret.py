@@ -214,7 +214,7 @@ class Interpreter(object):
         self.k = InterpContinuation(self)
         self.rk = InterpContinuation(self)
 
-        self.k
+        self.visited = {}
 
         self.stdin = None
         self.stdout = ''
@@ -402,6 +402,7 @@ class Interpreter(object):
 
     def visit(self, node):
         #node.show(showcoord=True)
+        self.visited[node] = True
         method = 'visit_' + node.__class__.__name__
         ret = getattr(self, method)(node)
         assert ret is None
@@ -904,10 +905,9 @@ class Interpreter(object):
 def preprocess_file(file_, is_code=False):
     dir_path = os.path.dirname(os.path.realpath(__file__))
     include_path = os.path.join(dir_path, 'clib/build/include')
-    cpp_args = [r'cpp', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
-                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=',
-                '-']
-    #cpp_args.append(file_ if not is_code else '-')
+    cpp_args = [r'clang', r'-E', r'-g3', r'-gdwarf-2', r'-nostdinc', r'-I' + include_path,
+                r'-D__attribute__(x)=', r'-D__builtin_va_list=int', r'-D_Noreturn=', r'-Dinline=', r'-D__volatile__=']
+    cpp_args.append(file_ if not is_code else '-')
 
     # reading from stdin
     #proc = subprocess.Popen(cpp_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE, encoding='latin-1')
@@ -916,7 +916,7 @@ def preprocess_file(file_, is_code=False):
     stdout = stdout.decode('latin-1')
     stderr = stderr.decode('latin-1')
     if len(stderr) != 0:
-        print('Uh oh! Stderr messages', proc.stderr)
+        print('Uh oh! Stderr messages', stderr)
     elif proc.returncode != 0:
         print('Uh oh! Nonzero error code')
     else:

@@ -1,9 +1,9 @@
 [submodule "clib/libcs50"]
-	path = centipyde/clib/libcs50
+	path = src/centipyde/clib/libcs50
 	url = https://github.com/cs50/libcs50.git
 [submodule "clib/musl"]
-	path = centipyde/clib/musl
+	path = src/centipyde/clib/musl
 	url = git://git.musl-libc.org/musl
 [submodule "virpy"]
-	path = centipyde/virpy
+	path = src/centipyde/virpy
 	url = git@github.com:rbowden91/virpy.git
