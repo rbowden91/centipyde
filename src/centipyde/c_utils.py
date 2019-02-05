@@ -19,6 +19,22 @@ def GetString(interpreter):
     type_ = [('(builtin)', ['string'], [], [])]
     return type_, helper
 
+def get_string(interpreter):
+    counter = 0
+    def helper(args):
+        stdin = interpreter.stdin.split('\n')
+        interpreter.stdin = stdin[1:]
+        stdin = bytearray(stdin[0], 'latin-1') + bytearray([0])
+        nonlocal counter
+        name = 'get_string ' + str(counter)
+        counter += 1
+        interpreter.memory_init(name, ['char'], len(stdin), stdin, 'heap')
+        return interpreter.make_val(['string'], Address(name, 0))
+
+    # TODO: technically const?
+    type_ = [('(builtin)', ['string'], [], [])]
+    return type_, helper
+
 def isalpha(interpreter):
     def helper(args):
         return interpreter.make_val(['int'], bytes([args[0].value]).decode('latin-1').isalpha())
@@ -58,13 +74,14 @@ def printf(interpreter):
         args = new_args
 
         if len(args) == 1:
-            interpreter.stdout += args[0]
+            interpreter.stdout += args[0][1:-1]
         else:
             fmt = args[0]
             args = args[1:]
             # lol the python fmt % args format
             # This presumably doesn't work with strings
-            interpreter.stdout += operator.mod(fmt, tuple(args))
+            # 1:-1 gets rid of the double quotes
+            interpreter.stdout += operator.mod(fmt[1:-1], tuple(args))
         return interpreter.make_val(['int'], 1)
 
     # TODO: technically const?

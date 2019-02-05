@@ -165,6 +165,9 @@ def is_void_function(type_):
 
 # make this a subclass, so the Continuation module doesn't need to know anything about
 # Interpreters
+
+class InterpTooLong(Exception): pass
+
 class InterpContinuation(Continuation):
 
     __slots__ = ['interpreter']
@@ -207,8 +210,9 @@ class InterpContinuation(Continuation):
     # memory the origin of a value??
 
 class Interpreter(object):
-    def __init__(self, ast, require_decls=True):
+    def __init__(self, ast, require_decls=True, max_steps=10000):
         self.require_decls = require_decls
+        self.max_steps = max_steps
 
         self.ast = ast
         self.k = InterpContinuation(self)
@@ -251,6 +255,7 @@ class Interpreter(object):
         return self.k.step()
 
     def run(self):
+        i = 0
         while True:
             ret = self.step()
             if ret is not None:
@@ -261,6 +266,10 @@ class Interpreter(object):
                 #    print(ret)
             else:
                 break
+
+            i += 1
+            if i >= self.max_steps:
+                raise InterpTooLong
 
     def make_val(self, type_, val):
         # TODO: associate the expanded_type with types_ instead of with vals?
@@ -399,6 +408,7 @@ class Interpreter(object):
         self.stdin = stdin
 
         self.k.visit(self.memory['main'].array[0])
+
 
     def visit(self, node):
         #node.show(showcoord=True)
@@ -934,3 +944,41 @@ def init_interpreter(file_, is_code=False):
         sys.exit(1)
 
     return Interpreter(ast)
+
+def run_tests(ast, tests):
+    results = []
+    visited = []
+    for test in tests:
+        result = test.copy()
+        # can we just instantiate one of these?
+        interpreter = Interpreter(ast)
+        interpreter.setup_main(test['argv'].split(), test['stdin'])
+        interpreter.run()
+        try:
+            assert len(interpreter.k.passthroughs) == 1
+        except:
+            #print('Something went wrong interpreting.')
+            return None
+        # handle lack of "return 0;" in main
+        ret = interpreter.k.passthroughs[0][0]
+        if ret.type != 'Return':
+            value = 0
+        else:
+            value = ret.value.value
+
+        result['actual_stdout'] = interpreter.stdout
+        result['actual_stderr'] = interpreter.stderr
+        result['actual_return'] = value
+
+        if ('expected_stdout' in result and re.match(result['expected_stdout'], result['actual_stdout'])) or \
+           ('expected_stderr' in result and re.match(result['expected_stderr'], result['actual_stderr'])) or \
+           ('expected_return' in result and result['expected_return'] != result['actual_return']):
+            result['passed'] = False
+        else:
+            result['passed'] = True
+
+        #result['visited'] = visited
+        results.append(result)
+        visited.append(interpreter.visited)
+
+    return results, visited
