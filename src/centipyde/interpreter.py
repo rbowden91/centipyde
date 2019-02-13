@@ -953,22 +953,26 @@ def run_tests(ast, tests):
         # can we just instantiate one of these?
         interpreter = Interpreter(ast)
         interpreter.setup_main(test['argv'].split(), test['stdin'])
-        interpreter.run()
         try:
+            interpreter.run()
             assert len(interpreter.k.passthroughs) == 1
-        except:
-            #print('Something went wrong interpreting.')
-            return None
-        # handle lack of "return 0;" in main
-        ret = interpreter.k.passthroughs[0][0]
-        if ret.type != 'Return':
-            value = 0
-        else:
-            value = ret.value.value
 
-        result['actual_stdout'] = interpreter.stdout
-        result['actual_stderr'] = interpreter.stderr
-        result['actual_return'] = value
+            ret = interpreter.k.passthroughs[0][0]
+            if ret.type != 'Return':
+                value = 0
+            else:
+                value = ret.value.value
+
+            result['actual_stdout'] = interpreter.stdout
+            result['actual_stderr'] = interpreter.stderr
+            result['actual_return'] = value
+        except:
+            # TODO ROB: this is n't the only possibility here
+            result['actual_stdout'] = 'Segementation Fault'
+            result['actual_return'] = ''
+            result['actual_stderr'] = ''
+            #print('Something went wrong interpreting.')
+        # handle lack of "return 0;" in main
 
         if ('expected_stdout' in result and re.match(result['expected_stdout'], result['actual_stdout'])) or \
            ('expected_stderr' in result and re.match(result['expected_stderr'], result['actual_stderr'])) or \
