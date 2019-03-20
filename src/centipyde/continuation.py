@@ -65,7 +65,7 @@ class Continuation(object):
         return self
 
     def handle_kprint(self, p):
-        print(p)
+        print(p())
 
     def loop(self, func, list_=False, shortcircuit=False):
         assert len(signature(func).parameters) == 1

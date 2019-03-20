@@ -5,8 +5,9 @@ import ctypes
 import inspect
 import operator
 import subprocess
+import copy
 from contextlib import contextmanager
-from pycparser import c_ast, c_parser
+from pycparser import c_ast, c_parser # type:ignore
 
 
 from inspect import signature, getsourcelines, getmembers
@@ -59,10 +60,10 @@ unops = {
    '!': operator.not_,
    }
 
-unops['sizeof'] = lambda: assert_false("TODO")
+unops['sizeof'] = lambda _: assert_false("TODO")
 # shouldn't call these directly, since they require accessing memory/locals
 for k in ['*', '&', 'p++', '++p', 'p--', '--p']:
-    unops[k] = lambda: assert_false("Shouldn't call these unops")
+    unops[k] = lambda _: assert_false("Shouldn't call these unops")
 
 python_type_map = {
     '_Bool': ctypes.c_bool,
@@ -210,7 +211,7 @@ class InterpContinuation(Continuation):
     # memory the origin of a value??
 
 class Interpreter(object):
-    def __init__(self, ast, require_decls=True, max_steps=10000):
+    def __init__(self, ast, test_name=None, require_decls=False, max_steps=10000):
         self.require_decls = require_decls
         self.max_steps = max_steps
 
@@ -218,12 +219,20 @@ class Interpreter(object):
         self.k = InterpContinuation(self)
         self.rk = InterpContinuation(self)
 
-        self.visited = {}
+        self.changes = {
+            'scope': [[{}]],
+            'stdout': '',
+            'stderr': '',
+            'memory': {},
+            'filesystem': {},
+            'return': False
+        }
 
         self.stdin = None
         self.stdout = ''
         self.stderr = ''
         self.filesystem = {}
+        self.test_name = test_name
 
         self.scope = [[{}]]
         self.context = ['global']
@@ -259,9 +268,63 @@ class Interpreter(object):
         while True:
             ret = self.step()
             if ret is not None:
-                pass
-                #if isinstance(ret, c_ast.Node):
-                #    ret.show(showcoord=True)
+                if isinstance(ret[0], c_ast.Node):
+                    node = ret[0]
+                    if ret[1] == 'entering':
+                        #node.show(showcoord=True)
+                        if 'visited' not in node.node_properties:
+                            node.node_properties['visited'] = {}
+                            node.node_properties['snapshots'] = {}
+                        node.node_properties['visited'][self.test_name] = True
+                        if self.test_name not in node.node_properties['snapshots']:
+                            node.node_properties['snapshots'][self.test_name] = []
+
+                        #ret.show(showcoord=True)
+                        node.node_properties['old_changes'] = self.changes
+                        new_changes = []
+                        for scope in self.changes['scope']:
+                            inner = []
+                            for i in range(len(scope)):
+                                inner.append({})
+                            new_changes.append(inner)
+                        self.changes = {
+                            'scope': new_changes,
+                            'memory': {},
+                            'filesystem': {},
+                            'stdout': '',
+                            'stderr': '',
+                            'return': False
+                        }
+                    else:
+                        assert ret[1] == 'leaving'
+                        # TODO check if before and after is same here?
+                        node.node_properties['snapshots'][self.test_name].append(self.changes)
+                        old_changes = node.node_properties['old_changes']
+                        del(node.node_properties['old_changes'])
+
+                        old_changes['stdout'] += self.changes['stdout']
+                        old_changes['stderr'] += self.changes['stderr']
+                        old_changes['return'] = self.changes['return']
+                        for i in range(len(self.changes['scope'])):
+                            for j in range(len(self.changes['scope'][i])):
+                                old_scope = old_changes['scope'][i][j]
+                                new_scope = self.changes['scope'][i][j]
+                                for id_ in new_scope:
+                                    if id_ not in old_scope:
+                                        old_scope[id_] = { 'before': new_scope[id_]['before'] }
+                                    old_scope[id_]['after'] = new_scope[id_]['after']
+                                    if old_scope[id_]['before'] == old_scope[id_]['after']:
+                                        del(old_scope[id_])
+                        for base in self.changes['memory']:
+                            for offset in self.changes['memory'][base]:
+                                if base not in old_changes['memory']:
+                                    old_changes['memory'][base] = {}
+                                if offset not in old_changes['memory'][base]:
+                                    old_changes['memory'][base][offset] = { 'before': self.changes['memory'][base][offset]['before'] }
+                                old_changes['memory'][base][offset]['after'] = self.changes['memory'][base][offset]['after']
+                                if old_changes['memory'][base][offset]['before'] == old_changes['memory'][base][offset]['after']:
+                                    del(old_changes['memory'][base][offset])
+                        self.changes = old_changes
                 #else:
                 #    print(ret)
             else:
@@ -306,19 +369,19 @@ class Interpreter(object):
     def pop_func_scope(self):
         (self.k
         .info(('pop_func_scope',), lambda scope: self.k.apply(lambda: self.push_func_scope(scope))
-                ).apply(lambda: self.scope.pop()))
+                ).apply(lambda: (self.scope.pop(), self.changes['scope'].pop())[0]))
 
     def push_func_scope(self, scope=None):
         # append the global map
         self.k.info(('push_func_scope',), lambda _: self.k.apply(lambda: self.pop_func_scope())
-                ).apply(lambda: self.scope.append([shelf.scope[0][0]]))
+                ).apply(lambda: (self.scope.append([self.scope[0][0]]), self.changes['scope'].append([{}])))
 
     def pop_scope(self):
         (self.k
-        .info(('pop_scope',)).apply(lambda: self.scope[-1].pop()))
+        .info(('pop_scope',)).apply(lambda: (self.scope[-1].pop(), self.changes['scope'][-1].pop())[0]))
 
     def push_scope(self):
-        self.k.info(('push_scope',)).apply(lambda: self.scope[-1].append({}))
+        self.k.info(('push_scope',)).apply(lambda: (self.scope[-1].append({}), self.changes['scope'][-1].append({})))
 
     # TODO: preemptively expand, so that expand_type doesn't have to expand until no changes
     # are made?
@@ -328,15 +391,37 @@ class Interpreter(object):
 
     def update_scope(self, id_, val, scope=-1):
 
+        if id_ not in self.changes['scope'][-1][scope]:
+            self.changes['scope'][-1][scope][id_] = {
+                'before': self.scope[-1][scope][id_].value if id_ in self.scope[-1][scope] else None
+            }
+        if isinstance(self.changes['scope'][-1][scope][id_]['before'], Address):
+            self.changes['scope'][-1][scope][id_]['before'] = (
+                self.changes['scope'][-1][scope][id_]['before'].base,
+                self.changes['scope'][-1][scope][id_]['before'].offset)
+        if isinstance(val.value, Address):
+            self.changes['scope'][-1][scope][id_]['after'] = (val.value.base, val.value.offset)
+        else:
+            self.changes['scope'][-1][scope][id_]['after'] = val.value
+
         # do this just for the self.k.info purposes
         old_var = id_ in self.scope[-1][scope]
+
 
         self.scope[-1][scope][id_] = val
 
         self.k.info(('update_scope', {'name': id_, 'value': val, 'old_var': old_var, 'scope': scope}))
 
-
+    # TODO: free memory
     def update_memory(self, base, offset, val):
+        if base not in self.changes['memory']:
+            self.changes['memory'][base] = {}
+        if offset not in self.changes['memory'][base]:
+            self.changes['memory'][base][offset] = {
+                'before': self.memory[base].array[offset]
+            }
+        self.changes['memory'][base][offset]['after'] = val.value
+
         # TODO: check types
         self.memory[base].array[offset] = val.value
         self.k.info(('memory_update', base, offset, val.value))
@@ -344,6 +429,9 @@ class Interpreter(object):
     def memory_init(self, name, type_, len_, array, segment):
         expanded_type = expand_type(type_, self.typedefs)
         self.memory[name] = Memory(type_, expanded_type, name, len_, array, segment)
+        if segment == 'text':
+            # FIXME
+            self.scope[-1][0][name] = self.make_val([type_], self.memory[name])
         (self.k
         .info(('memory_init', self.memory[name])))
         #.passthrough(self.memory[name]))
@@ -411,17 +499,27 @@ class Interpreter(object):
 
 
     def visit(self, node):
-        #node.show(showcoord=True)
-        self.visited[node] = True
         method = 'visit_' + node.__class__.__name__
+        self.k.info([node, 'entering'])
         ret = getattr(self, method)(node)
         assert ret is None
+        self.k.info([node, 'leaving'])
+
+
+    def visit_ExpressionList(self, n):
+        self.stmt_helper(n.expressions, False)
+
+    def visit_NodeWrapper(self, n):
+        if n.new is not None:
+            self.k.visit(n.new)
+        else:
+            self.k.passthrough(lambda: Flow('Normal'))
 
     def visit_ArrayRef(self, n):
         # TODO: shouldn't be allowed to assign to symbols / consts? Actually, symbols would fall under visit_ID
         # TODO: nested array refs?? argv[1][2]. need to handle dims appropriately
 
-        (self.k.info(n)
+        (self.k
         # we want to get rid of any lvalue context if we are eventually assigning to the array
         .push_context('arrayref')
         .visit(n.name)
@@ -460,7 +558,7 @@ class Interpreter(object):
             value = self.make_val(lval.type, value)
             self.k.apply(lambda: assignment_op(value)).passthrough(lambda: value)
 
-        (self.k.info(n)
+        (self.k
         .push_context('lvalue')
         .visit(n.lvalue)
         .pop_context()
@@ -478,7 +576,7 @@ class Interpreter(object):
 
     def visit_Cast(self, n):
         # TODO: validate
-        (self.k.info(n)
+        (self.k
         .visit(n.to_type)
         .expect(lambda type_: self.k
             .visit(n.expr).expect(lambda val:
@@ -489,7 +587,7 @@ class Interpreter(object):
         assert n.op in binops
 
         # TODO cast to c type nonsense
-        (self.k.info(n)
+        (self.k
         .visit(n.left)
         .expect(lambda lval:
             self.k
@@ -545,12 +643,17 @@ class Interpreter(object):
 
     def visit_Break(self, n):
         #TODO assert continuation['break'] is not None, 'Break in of invalid context'
-        self.k.info(n).passthrough(lambda: Flow('Break'))
+        self.k.passthrough(lambda: Flow('Break'))
 
-    def visit_Compound(self, n):
-        # TODO: do we actually ever even care to stop on this node?
-        (self.k.info(n)
-        .loop_var(n.block_items)
+    def stmt_helper(self, items, new_scope):
+        if items is None or len(items) == 0:
+            return self.k.passthrough(lambda: Flow('Normal'))
+
+        if new_scope:
+            self.k.push_scope()
+
+        (self.k
+        .loop_var(items)
         # TODO: can't use loop, since we need to shortcut
         .loop((lambda stmt:
             self.k
@@ -565,9 +668,15 @@ class Interpreter(object):
         .expect(lambda flows:
             self.k.passthrough(lambda: Flow('Normal', None) if isinstance(flows[-1], Val) else flows[-1])))
 
+        if new_scope:
+            self.k.pop_scope()
+
+    def visit_Compound(self, n):
+        self.stmt_helper(n.block_items, True)
+
     def visit_Constant(self, n):
         # TODO: necessary to expand the type??
-        self.k.info(n)
+        self.k
         if not is_string_type(n.type):
             self.k.passthrough(lambda: self.make_val([n.type], cast_to_python_val(self.make_val([n.type], n.value))))
         else:
@@ -576,20 +685,20 @@ class Interpreter(object):
     def visit_Continue(self, n):
         #assert continuations['continue'] is not None, 'Continue in invalid context'
         # TODO: put the loop in scope context
-        (self.k.info(n).passthrough(lambda: Flow('Continue')))
+        (self.k.passthrough(lambda: Flow('Continue')))
 
     # name: the variable being declared
     # quals: list of qualifiers (const, volatile)
     # funcspec: list function specifiers (i.e. inline in C99)
     # storage: list of storage specifiers (extern, register, etc.)
-    # type: declaration type (probably nested with all the modifiers)
+    # type : declaration type (probably nested with all the modifiers)
     # init: initialization value, or None
     # bitsize: bit field size, or None
     def decl_helper(self, n, type_):
         # TODO: compare n.type against type_ for validity
         # TODO: funcdecls might be declared multiple times?
         # TODO: doesn't return the name
-        (self.k.info(n)
+        (self.k
         .if_(n.type, lambda: self.k.visit(n.type))
         # The function type should be the next passthrough
         .expect(lambda type_: self.k
@@ -599,9 +708,11 @@ class Interpreter(object):
                 .pop_context()
                 # TODO: validate the type
                 .expect(lambda val: self.k
-                    .apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, val.value)))))
-            .else_(lambda: self.k.apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, None)))))
-        .passthrough(lambda: Flow('Normal')))
+                    .apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, val.value)))
+                    .passthrough(lambda: self.make_val(type_, val.value))))
+            .else_(lambda: self.k
+                .apply(lambda: self.update_scope(id_=n.name, val=self.make_val(type_, None)))
+                .passthrough(lambda: self.make_val(type_, None)))))
 
     def visit_Decl(self, n):
         # TODO: can n.type ever be None? only for funcdecl?
@@ -610,7 +721,7 @@ class Interpreter(object):
 
 
     def visit_DeclList(self, n):
-        (self.k.info(n)
+        (self.k
         .loop_var(n.decls)
         .loop(lambda decl:
             self.k.visit(decl)))
@@ -619,7 +730,7 @@ class Interpreter(object):
         #.passthrough(lambda: Flow('Normal')))
 
     def visit_ExprList(self, n):
-        (self.k.info(n)
+        (self.k
         .loop_var(n.exprs)
         .loop(lambda expr: self.k.visit(expr)))
 
@@ -634,19 +745,19 @@ class Interpreter(object):
                 .kassert(lambda: not self.require_decls, 'Undeclared identifier: ' + n.name)
                 .passthrough(lambda: -1))
 
-        (self.k.info(n)
+        (self.k
         .apply(helper)
         .expect(lambda scope:
             self.k
             .if_(self.context[-1] == 'lvalue', lambda: self.k
                 .passthrough(lambda: lambda val: self.update_scope(n.name, val, scope)))
             .else_(lambda: self.k
-                .kassert(lambda: self.scope[-1][scope][n.name].value is not None, "Uninitialized variable")
+                .kassert(lambda: self.scope[-1][scope][n.name].value is not None, "Uninitialized variable" + n.name)
                 .passthrough(lambda: self.scope[-1][scope][n.name]))))
 
     def visit_FileAST(self, n):
         # TODO: put global map placement in here??
-        (self.k.info(n)
+        (self.k
         .loop_var(n.ext)
         .loop(lambda ext: self.k.visit(ext))
         # don't really care about the return
@@ -654,7 +765,7 @@ class Interpreter(object):
 
     def visit_For(self, n):
         def for_inner():
-            self.k.info(n)
+            #self.k.info(n)
             if n.cond: self.k.visit(n.cond)
             else: self.k.passthrough(lambda: self.make_val(['_Bool'], True))
 
@@ -668,9 +779,10 @@ class Interpreter(object):
                             .visit(n.next)
                             .expect(lambda _: None)
                             .apply(for_inner))
-                        .elseif(flow.type == 'Return', lambda: self.k.passthrough(lambda: flow))
+                        .elseif(flow.type == 'Return', lambda: self.k.pop_scope().passthrough(lambda: flow))
                         .else_(lambda: self.k
                             .kassert(lambda: flow.type == 'Break', 'Invalid flow to for loop')
+                            .pop_scope()
                             .passthrough(lambda: Flow('Normal'))))))
                 .else_(lambda: self.k
                     .pop_scope()
@@ -678,7 +790,6 @@ class Interpreter(object):
 
 
         # TODO: can we declare a variable in both for (int i) { int i; ??
-        self.k.info(n)
         # TODO only do this if n.init exists??
         self.push_scope()
         if n.init:
@@ -693,18 +804,25 @@ class Interpreter(object):
         #if self.memory[n.name]['type'][0][0] == '(builtin)':
         # TODO: this needs to be expanded, since we might have weird types in c_utils?
 
-        (self.k.info(n).visit(n.name)
-        .expect(lambda name: self.k
+        (self.k.visit(n.name)
+        .expect(lambda funcname: self.k
             .if_(n.args, lambda: self.k.visit(n.args))
             .else_(lambda: self.k.passthrough(lambda: []))
             .expect(lambda args: self.k
-                .if_(self.memory[name.value].type[0][0] == '(builtin)', lambda: self.k
-                    .apply(lambda: self.memory[name.value].array[0](args)))
+                .if_(funcname.value.type[0][0] == '(builtin)', lambda: self.k
+                    .apply(lambda: funcname.value.array[0](args)))
                 .else_(lambda: self.k
-                    .kassert(lambda: self.memory[name.value].type[0][0] == '(user-defined)', 'blah3')
+                    .kassert(lambda: funcname.value.type[0][0] == '(user-defined)', 'blah3')
                     # TODO: make these push_func_scope
-                    .apply(self.push_func_scope)
-                    .visit(self.memory[name.value].array[0])
+                    .apply(lambda: self.push_func_scope())
+                    .apply(lambda: self.push_scope())
+                    # set args
+                    .apply(lambda: [self.update_scope(funcname.value.type[2][i],
+                                        self.make_val(funcname.value.type[3][i], args[i]))
+                                        for i in range(len(funcname.value.type[2]))])
+                    .visit(funcname.value.array[0])
+                    .apply(lambda: self.pop_scope())
+                    .visit(funcname.value.array[0])
                     .apply(self.pop_func_scope)
                     # TODO: check return type
                     .expect(lambda flow:
@@ -716,16 +834,16 @@ class Interpreter(object):
 
     def visit_Typedef(self, n):
         # TODO: quals, storage, etc.
-        (self.k.info(n).visit(n.type)
+        (self.k.visit(n.type)
         .expect(lambda type_: self.k
             .apply(lambda: self.update_type(n.name, type_))
             .passthrough(lambda: Flow('Normal'))))
 
     def visit_TypeDecl(self, n):
-        self.k.info(n).visit(n.type)
+        self.k.visit(n.type)
 
     def visit_ArrayDecl(self, n):
-        (self.k.info(n)
+        (self.k
         .visit(n.type)
         .expect(lambda type_: self.k
             .if_(n.dim, lambda: self.k.visit(n.dim).expect(lambda dim: self.k.passthrough(lambda: str(dim.value))))
@@ -734,12 +852,12 @@ class Interpreter(object):
 
 
     def visit_IdentifierType(self, n):
-        self.k.info(n).passthrough(lambda: n.names)
+        self.k.passthrough(lambda: n.names)
 
     def visit_ParamList(self, n):
         # TODO: can param.name be empty?
         # TODO: ellipsisparam should only go at the end
-        (self.k.info(n)
+        (self.k
         .loop_var(n.params)
         .loop(lambda param:
             self.k
@@ -752,10 +870,10 @@ class Interpreter(object):
     def visit_FuncDecl(self, n):
         # only the funcdef funcdecl will necessarily have parameter names
         # TODO: this can theoretically appear inside of funcdefs, but we would step over it
-        (self.k.info(n).visit(n.type)
+        (self.k.visit(n.type)
         .expect(lambda ret_type: self.k
             .if_(n.args, lambda: self.k.visit(n.args))
-            .else_(lambda: self.k.expect(lambda ret_type: self.k.passthrough(lambda: ([], []))))
+            .else_(lambda: self.k.passthrough(lambda: ([], [])))
             .expect(lambda params:
                 self.k.passthrough(lambda: [('(user-defined)', ret_type,
                     [param[0] for param in params],
@@ -770,7 +888,7 @@ class Interpreter(object):
 
     def visit_FuncDef(self, n):
         # TODO: check against prior funcdecls?
-        (self.k.info(n)
+        (self.k
         .visit(n.decl)
         .expect(lambda val:
             self.k.apply(lambda: self.memory_init(n.decl.name, val.type, 1, [n.body], 'text')))
@@ -778,7 +896,6 @@ class Interpreter(object):
 
 
     def visit_If(self, n):
-        self.k.info(n)
         if n.cond: self.k.visit(n.cond)
         # TODO: cprrect default?
         else: self.k.passthrough(lambda: self.make_val(['_Bool'], True))
@@ -791,13 +908,13 @@ class Interpreter(object):
             .else_(lambda: self.k.passthrough(lambda: Flow('Normal'))))
 
     def visit_PtrDecl(self, n):
-        (self.k.info(n)
+        (self.k
         .visit(n.type)
         .expect(lambda type_: self.k.passthrough(lambda: ['*'] + type_)))
 
     def visit_Union(self, n):
         # TODO: finish this
-        (self.k.info(n)
+        (self.k
         .loop_var(n.decls)
         .loop(lambda decl: self.k.visit(decl))
         .expect(lambda decls: self.k
@@ -806,7 +923,7 @@ class Interpreter(object):
 
     def visit_Struct(self, n):
         # TODO: finish this
-        (self.k.info(n)
+        (self.k
         .loop_var(n.decls)
         .loop(lambda decl: self.k.visit(decl))
         .expect(lambda decls: self.k
@@ -818,7 +935,7 @@ class Interpreter(object):
     # TODO:shouldn't it disallow
     # some things inside of it?
     def visit_TernaryOp(self, n):
-        (self.k.info(n)
+        (self.k
         .visit(n.cond)
         .expect(lambda cond: self.k
             .if_(cond.value, lambda: self.k.visit(n.iftrue))
@@ -826,7 +943,7 @@ class Interpreter(object):
 
     def visit_Typename(self, n):
         # TODO: stuff with n.quals
-        (self.k.info(n)
+        (self.k
         # TODO: don't know when this is not None
         .kassert(lambda: not n.name, 'uh oh')
         .visit(n.type))
@@ -874,39 +991,37 @@ class Interpreter(object):
                 value = self.make_val(val.type, value)
                 self.k.passthrough(lambda: value)
 
-        self.k.info(n).visit(n.expr).expect(helper)
+        self.k.visit(n.expr).expect(helper)
 
 
     # TODO: detect infinite loop??
     def visit_While(self, n):
-        self.k.info(n)
+        def while_inner():
+            if n.cond: self.k.visit(n.cond)
+            # TODO: is True the right default? can the condition even be empty?
+            else: self.k.passthrough(lambda: self.make_val(['_Bool'], True))
 
-        if n.cond: self.k.visit(n.cond)
-        # TODO: is True the right default? can the condition even be empty?
-        else: self.k.passthrough(lambda: self.make_val(['_Bool'], True))
-
-        (self.k.expect(lambda cond:
-            self.k
-            .if_(cond.value, lambda: self.k
-                .visit(n.stmt)
-                .expect(lambda flow: self.k
-                    .kassert(lambda: isinstance(flow, Flow), 'blah5')
-                    .if_(flow.type == 'Continue' or flow.type == 'Normal', lambda: self.k.visit(n))
-                    .elseif(flow.type == 'Break', lambda: self.k.passthrough(lambda: Flow('Normal')))
-                    .else_(lambda: self.k
-                        .kassert(lambda: flow.type == 'Return', 'blah6')
-                        .passthrough(lambda: flow))))
-            .else_(lambda: self.k.passthrough(lambda: Flow('Normal')))))
-
-
-
+            (self.k.expect(lambda cond:
+                self.k
+                .if_(cond.value, lambda: self.k
+                    .visit(n.stmt)
+                    .expect(lambda flow: self.k
+                        .kassert(lambda: isinstance(flow, Flow), 'blah5')
+                        .if_(flow.type == 'Continue' or flow.type == 'Normal', lambda: self.k.apply(while_inner))
+                        .elseif(flow.type == 'Break', lambda: self.k.passthrough(lambda: Flow('Normal')))
+                        .else_(lambda: self.k
+                            .kassert(lambda: flow.type == 'Return', 'blah6')
+                            .passthrough(lambda: flow))))
+                .else_(lambda: self.k.passthrough(lambda: Flow('Normal')))))
+        self.k.apply(while_inner)
 
     def visit_Return(self, n):
-        self.k.info(n)
         if n.expr: self.k.visit(n.expr)
         # TODO: we very explicitly want this to pass through to self.k.expect, not to the upper continuation
         else: self.k.passthrough(lambda: None)
-        self.k.expect(lambda val: self.k.passthrough(lambda: Flow('Return', val)))
+        self.k.expect(lambda val: self.k
+                .apply(lambda: self.changes.__setitem__('return', val.value if val is not None else 'void'))
+                .passthrough(lambda: Flow('Return', val)))
 
         # TODO: can we even write a return outside of a function?
         # TODO: we need to check this elsewhere
@@ -951,7 +1066,7 @@ def run_tests(ast, tests):
     for test in tests:
         result = test.copy()
         # can we just instantiate one of these?
-        interpreter = Interpreter(ast)
+        interpreter = Interpreter(ast, test['name'])
         interpreter.setup_main(test['argv'].split(), test['stdin'])
         try:
             interpreter.run()
@@ -967,22 +1082,19 @@ def run_tests(ast, tests):
             result['actual_stderr'] = interpreter.stderr
             result['actual_return'] = value
         except:
-            # TODO ROB: this is n't the only possibility here
-            result['actual_stdout'] = 'Segementation Fault'
-            result['actual_return'] = ''
+            result['actual_stdout'] = 'Error interpreting code'
             result['actual_stderr'] = ''
+            result['actual_return'] = ''
             #print('Something went wrong interpreting.')
         # handle lack of "return 0;" in main
 
-        if ('expected_stdout' in result and re.match(result['expected_stdout'], result['actual_stdout'])) or \
-           ('expected_stderr' in result and re.match(result['expected_stderr'], result['actual_stderr'])) or \
+        if ('expected_stdout' in result and not re.match(result['expected_stdout'], result['actual_stdout'])) or \
+           ('expected_stderr' in result and not re.match(result['expected_stderr'], result['actual_stderr'])) or \
            ('expected_return' in result and result['expected_return'] != result['actual_return']):
             result['passed'] = False
         else:
             result['passed'] = True
 
-        #result['visited'] = visited
         results.append(result)
-        visited.append(interpreter.visited)
 
-    return results, visited
+    return results

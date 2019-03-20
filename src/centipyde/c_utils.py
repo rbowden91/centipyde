@@ -74,14 +74,17 @@ def printf(interpreter):
         args = new_args
 
         if len(args) == 1:
-            interpreter.stdout += args[0][1:-1]
+            stdout = args[0][1:-1]
         else:
             fmt = args[0]
             args = args[1:]
             # lol the python fmt % args format
-            # This presumably doesn't work with strings
             # 1:-1 gets rid of the double quotes
-            interpreter.stdout += operator.mod(fmt[1:-1], tuple(args))
+            # TODO: iterate over %s to look for \0. for now, blindly assume it's there
+            args = [(string.strip('\x00') if isinstance(string, str) else string) for string in args]
+            stdout = operator.mod(fmt[1:-1], tuple(args))
+        interpreter.stdout += stdout
+        interpreter.changes['stdout'] += stdout
         return interpreter.make_val(['int'], 1)
 
     # TODO: technically const?
@@ -94,7 +97,7 @@ def strlen(interpreter):
         arr, offset = args[0].value.base, args[0].value.offset
         # -1 to remove the \0
         # TODO: myassert
-        assert offset < interpreter.memory[arr].len - 1
+        assert offset <= interpreter.memory[arr].len - 1
         return interpreter.make_val(['size_t'], interpreter.memory[arr].len - offset - 1)
 
     # TODO: technically const?
