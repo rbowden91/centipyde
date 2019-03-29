@@ -270,7 +270,6 @@ class Interpreter(object):
                     node = ret[0]
                     if ret[1] == 'entering':
                         #node.show(showcoord=True)
-                        print(node)
                         node.node_properties['visited'][self.test_name] = True
 
                         #ret.show(showcoord=True)
