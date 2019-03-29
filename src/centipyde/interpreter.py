@@ -9,13 +9,11 @@ import copy
 from contextlib import contextmanager
 from pycparser import c_ast, c_parser # type:ignore
 
-
 from inspect import signature, getsourcelines, getmembers
 
 from .values import *
 from .continuation import Continuation
 from . import c_utils
-
 
 # TODO: check results for overflow???
 binops = {
@@ -272,12 +270,8 @@ class Interpreter(object):
                     node = ret[0]
                     if ret[1] == 'entering':
                         #node.show(showcoord=True)
-                        if 'visited' not in node.node_properties:
-                            node.node_properties['visited'] = {}
-                            node.node_properties['snapshots'] = {}
+                        print(node)
                         node.node_properties['visited'][self.test_name] = True
-                        if self.test_name not in node.node_properties['snapshots']:
-                            node.node_properties['snapshots'][self.test_name] = []
 
                         #ret.show(showcoord=True)
                         node.node_properties['old_changes'] = self.changes
