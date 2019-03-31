@@ -345,7 +345,7 @@ class Interpreter(object):
         return self.k.step()
 
     def run(self):
-        i = 0
+        num_steps = 0
         while True:
             ret = self.step()
             if ret is not None:
@@ -405,8 +405,8 @@ class Interpreter(object):
             else:
                 break
 
-            i += 1
-            if i >= self.max_steps:
+            num_steps += 1
+            if num_steps >= self.max_steps:
                 raise InterpTooLong()
 
 
@@ -593,6 +593,7 @@ class Interpreter(object):
 
 
     def visit(self, node):
+        #print(node.__class__.__name__)
         method = 'visit_' + node.__class__.__name__
         self.k.info([node, 'entering'])
         node.node_properties['visited'][self.test['name']] = True
@@ -1176,6 +1177,7 @@ def run_tests(ast, tests):
                 result['passed'] = True
             except InterpTooLong:
                 result['error'] = 'Infinite Loop?'
+                print('Infinite loop?')
             except SegmentationFault:
                 result['error'] = 'Segmentation Fault'
             except ExpectedStdin:
