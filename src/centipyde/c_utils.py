@@ -1,14 +1,13 @@
 import operator
 
 from .values import Address, Val
+from .exceptions import SegmentationFault
 
 # TODO: strings should include \0...
 def GetString(interpreter):
     counter = 0
     def helper(args):
-        stdin = interpreter.stdin.split('\n')
-        interpreter.stdin = stdin[1:]
-        stdin = bytearray(stdin[0], 'latin-1') + bytearray([0])
+        stdin = interpreter.get_stdin()
         nonlocal counter
         name = 'GetString ' + str(counter)
         counter += 1
@@ -22,11 +21,9 @@ def GetString(interpreter):
 def get_string(interpreter):
     counter = 0
     def helper(args):
-        stdin = interpreter.stdin.split('\n')
-        interpreter.stdin = stdin[1:]
-        stdin = bytearray(stdin[0], 'latin-1') + bytearray([0])
+        stdin = interpreter.get_stdin()
         nonlocal counter
-        name = 'get_string ' + str(counter)
+        name = 'GetString ' + str(counter)
         counter += 1
         interpreter.memory_init(name, ['char'], len(stdin), stdin, 'heap')
         return interpreter.make_val(['string'], Address(name, 0))
@@ -83,8 +80,7 @@ def printf(interpreter):
             # TODO: iterate over %s to look for \0. for now, blindly assume it's there
             args = [(string.strip('\x00') if isinstance(string, str) else string) for string in args]
             stdout = operator.mod(fmt[1:-1], tuple(args))
-        interpreter.stdout += stdout
-        interpreter.changes['stdout'] += stdout
+        interpreter.put_stdout(stdout)
         return interpreter.make_val(['int'], 1)
 
     # TODO: technically const?
@@ -97,7 +93,8 @@ def strlen(interpreter):
         arr, offset = args[0].value.base, args[0].value.offset
         # -1 to remove the \0
         # TODO: myassert
-        assert offset <= interpreter.memory[arr].len - 1
+        if offset >= interpreter.memory[arr].len:
+            raise SegmentationFault()
         return interpreter.make_val(['size_t'], interpreter.memory[arr].len - offset - 1)
 
     # TODO: technically const?

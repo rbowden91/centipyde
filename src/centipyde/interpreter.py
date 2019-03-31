@@ -13,6 +13,7 @@ from inspect import signature, getsourcelines, getmembers
 
 from .values import *
 from .continuation import Continuation
+from .exceptions import *
 from . import c_utils
 
 # TODO: check results for overflow???
@@ -165,7 +166,12 @@ def is_void_function(type_):
 # make this a subclass, so the Continuation module doesn't need to know anything about
 # Interpreters
 
-class InterpTooLong(Exception): pass
+exceptions = {
+    'return': {'expected': ExpectedReturn, 'incorrect': IncorrectReturn},
+    'stdout': {'expected': ExpectedStdout, 'incorrect': IncorrectStdout},
+    'stderr': {'expected': ExpectedStderr, 'incorrect': IncorrectStderr},
+    'stdin': {'expected': ExpectedStdin},
+}
 
 class InterpContinuation(Continuation):
 
@@ -209,7 +215,7 @@ class InterpContinuation(Continuation):
     # memory the origin of a value??
 
 class Interpreter(object):
-    def __init__(self, ast, test_name=None, require_decls=False, max_steps=10000):
+    def __init__(self, ast, test=None, require_decls=False, max_steps=10000):
         self.require_decls = require_decls
         self.max_steps = max_steps
 
@@ -229,8 +235,11 @@ class Interpreter(object):
         self.stdin = None
         self.stdout = ''
         self.stderr = ''
+        self.ret_val = None
         self.filesystem = {}
-        self.test_name = test_name
+        self.buffered_output = {'type': None, 'value': ''}
+        self.test = test
+        self.test_step = 0
 
         self.scope = [[{}]]
         self.context = ['global']
@@ -258,6 +267,80 @@ class Interpreter(object):
                     [(lambda func: lambda args: self.k.passthrough(lambda: func(args)))(func)], 'text')
         self.run()
 
+    def inc_test_step(self):
+        self.test_step += 1
+        if self.test_step >= len(self.test['run']):
+            raise PassedAllTestSteps()
+
+    def check_partial_regex(self, test_value, buffered_value):
+        partial_regex = ''
+        # we don't want an empty print to stdout to count as invalid
+        for i in test_value:
+            if re.match(partial_regex, buffered_value):
+                return partial_regex
+            partial_regex += i
+        if re.match(partial_regex, buffered_value):
+            return partial_regex
+        return False
+
+    def get_test_step(self, actual_type, output=None):
+        assert self.test is not None
+        test_step = self.test['run'][self.test_step]
+        if self.buffered_output['type'] is None and test_step['type'] in ['stdout', 'stderr']:
+            if test_step['type'] != actual_type:
+                raise exceptions[test_step['type']]['expected']()
+            self.buffered_output['type'] = test_step['type']
+
+        if self.buffered_output['type'] == test_step['type']:
+            if actual_type == test_step['type']:
+                assert output is not None
+                self.buffered_output['value'] += output
+                partial_regex = self.check_partial_regex(test_step['value'], self.buffered_output['value'])
+                if partial_regex is False:
+                    raise exceptions[test_step['type']]['incorrect']()
+                self.stdout += output
+                # TODO: incrementally handle the regexes better...
+                self.changes['stdout'] += ".+\\n" if partial_regex == '.+\\\\n' else output
+                return
+            else:
+                # make sure the entire regex has been matched
+                if not re.match(''.join(test_step['value']), self.buffered_output['value']):
+                    raise exceptions[test_step['type']]['incorrect']()
+                self.buffered_output['type'] = None
+                self.buffered_output['value'] = ''
+
+                self.inc_test_step()
+                return self.get_test_step(actual_type, output)
+
+        if test_step['type'] == actual_type:
+            return test_step['value']
+
+        raise exceptions[test_step['type']]['expected']()
+
+
+    def get_stdin(self):
+        if self.stdin is not None:
+            stdin = self.stdin.split('\n')
+            self.stdin = stdin[1:]
+            stdin = stdin[0]
+        else:
+            stdin = self.get_test_step('stdin')
+            self.inc_test_step()
+
+        return bytearray(stdin, 'latin-1') + bytearray([0])
+
+    def put_stderr(self, stderr):
+        if self.test is not None:
+            self.get_test_step('stderr', stdout)
+        else:
+            self.stderr += stderr
+
+    def put_stdout(self, stdout):
+        if self.test is not None:
+            self.get_test_step('stdout', stdout)
+        else:
+            self.stdout += stdout
+
     def step(self):
         return self.k.step()
 
@@ -270,7 +353,6 @@ class Interpreter(object):
                     node = ret[0]
                     if ret[1] == 'entering':
                         #node.show(showcoord=True)
-                        node.node_properties['visited'][self.test_name] = True
 
                         #ret.show(showcoord=True)
                         node.node_properties['old_changes'] = self.changes
@@ -291,7 +373,7 @@ class Interpreter(object):
                     else:
                         assert ret[1] == 'leaving'
                         # TODO check if before and after is same here?
-                        node.node_properties['snapshots'][self.test_name].append(self.changes)
+                        node.node_properties['snapshots'][self.test['name']].append(self.changes)
                         old_changes = node.node_properties['old_changes']
                         del(node.node_properties['old_changes'])
 
@@ -325,7 +407,8 @@ class Interpreter(object):
 
             i += 1
             if i >= self.max_steps:
-                raise InterpTooLong
+                raise InterpTooLong()
+
 
     def make_val(self, type_, val):
         # TODO: associate the expanded_type with types_ instead of with vals?
@@ -416,6 +499,7 @@ class Interpreter(object):
         self.changes['memory'][base][offset]['after'] = val.value
 
         # TODO: check types
+        # VAlueError: byte must be in range 0-256
         self.memory[base].array[offset] = val.value
         self.k.info(('memory_update', base, offset, val.value))
 
@@ -453,7 +537,7 @@ class Interpreter(object):
     # executes a program from the main function
     # shouldn't call this multiple times, since memory might be screwed up (global values not reinitialized, etc.)
     # TODO: _start??
-    def setup_main(self, argv, stdin):
+    def setup_main(self, argv, stdin=None):
 
         # TODO: need to reset global variables to initial values as well
         #for i in list(self.memory.keys()):
@@ -490,10 +574,28 @@ class Interpreter(object):
 
         self.k.visit(self.memory['main'].array[0])
 
+        self.run()
+
+        assert len(self.k.passthroughs) == 1
+
+        ret = self.k.passthroughs[0][0]
+
+        # TODO: void?
+        self.ret_val = ret.value.value if ret.type == 'Return' else 0
+
+        if self.test:
+            expected_return = self.get_test_step('return')
+            if expected_return != self.ret_val:
+                raise IncorrectReturn()
+            self.inc_test_step()
+
+        return self.ret_val
+
 
     def visit(self, node):
         method = 'visit_' + node.__class__.__name__
         self.k.info([node, 'entering'])
+        node.node_properties['visited'][self.test['name']] = True
         ret = getattr(self, method)(node)
         assert ret is None
         self.k.info([node, 'leaving'])
@@ -1055,39 +1157,48 @@ def init_interpreter(file_, is_code=False):
 
 def run_tests(ast, tests):
     results = []
-    visited = []
-    for test in tests:
-        result = test.copy()
-        # can we just instantiate one of these?
-        interpreter = Interpreter(ast, test['name'])
-        interpreter.setup_main(test['argv'].split(), test['stdin'])
-        try:
-            interpreter.run()
-            assert len(interpreter.k.passthroughs) == 1
+    for test_group in tests:
+        result_group = {}
+        for test_name in test_group:
+            result = result_group[test_name] = test_group[test_name].copy()
+            result['name'] = test_name
 
-            ret = interpreter.k.passthroughs[0][0]
-            if ret.type != 'Return':
-                value = 0
-            else:
-                value = ret.value.value
-
-            result['actual_stdout'] = interpreter.stdout
-            result['actual_stderr'] = interpreter.stderr
-            result['actual_return'] = value
-        except:
-            result['actual_stdout'] = 'Error interpreting code'
-            result['actual_stderr'] = ''
-            result['actual_return'] = ''
-            #print('Something went wrong interpreting.')
-        # handle lack of "return 0;" in main
-
-        if ('expected_stdout' in result and not re.match(result['expected_stdout'], result['actual_stdout'])) or \
-           ('expected_stderr' in result and not re.match(result['expected_stderr'], result['actual_stderr'])) or \
-           ('expected_return' in result and result['expected_return'] != result['actual_return']):
+            # TODO: can we just instantiate one of these?
+            interpreter = Interpreter(ast, result)
             result['passed'] = False
-        else:
-            result['passed'] = True
+            try:
+                interpreter.setup_main(result['argv'].split(), None)
 
-        results.append(result)
+                # we didn't encounter "PassedAllTestSteps", which means there are still expected
+                # test steps, so we failed
+                interpreter.get_test_step(None)
+            except PassedAllTestSteps:
+                result['passed'] = True
+            except InterpTooLong:
+                result['error'] = 'Infinite Loop?'
+            except SegmentationFault:
+                result['error'] = 'Segmentation Fault'
+            except ExpectedStdin:
+                result['error'] = 'Expected Stdin'
+            except ExpectedStdout:
+                result['error'] = 'Expected Stdout'
+            except ExpectedStderr:
+                result['error'] = 'Expected Stderr'
+            except ExpectedReturn:
+                result['error'] = 'Expected Return'
+            except IncorrectStdout:
+                result['error'] = 'Incorrect stdout'
+            except IncorrectStderr:
+                result['error'] = 'Incorrect stderr'
+            except IncorrectReturn:
+                result['error'] = 'Incorrect return value'
+            except:
+                result['error'] = 'Internal error interpreting code'
+
+            result['stdout'] = interpreter.stdout
+            result['stderr'] = interpreter.stderr
+            result['return'] = interpreter.ret_val
+
+        results.append(result_group)
 
     return results
