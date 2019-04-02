@@ -222,6 +222,7 @@ class Interpreter(object):
         self.ast = ast
         self.k = InterpContinuation(self)
         self.rk = InterpContinuation(self)
+        self.old_changes = {}
 
         self.changes = {
             'scope': [[{}]],
@@ -355,7 +356,10 @@ class Interpreter(object):
                         #node.show(showcoord=True)
 
                         #ret.show(showcoord=True)
-                        node.node_properties['old_changes'] = self.changes
+                        # TODO: do recursive calls work?
+                        if node not in self.old_changes:
+                            self.old_changes[node] = []
+                        self.old_changes[node].append(self.changes)
                         new_changes = []
                         for scope in self.changes['scope']:
                             inner = []
@@ -373,10 +377,10 @@ class Interpreter(object):
                     else:
                         assert ret[1] == 'leaving'
                         # TODO check if before and after is same here?
-                        node.node_properties['snapshots'][self.test['name']].append(self.changes)
-                        old_changes = node.node_properties['old_changes']
-                        del(node.node_properties['old_changes'])
+                        node.node_properties['test_data'][self.test['name']]['snapshots'].append(self.changes)
+                        old_changes = self.old_changes[node].pop()
 
+                        # merge changes
                         old_changes['stdout'] += self.changes['stdout']
                         old_changes['stderr'] += self.changes['stderr']
                         old_changes['return'] = self.changes['return']
@@ -596,7 +600,8 @@ class Interpreter(object):
         #print(node.__class__.__name__)
         method = 'visit_' + node.__class__.__name__
         self.k.info([node, 'entering'])
-        node.node_properties['visited'][self.test['name']] = True
+        if self.test['name'] not in node.node_properties['test_data']:
+            node.node_properties['test_data'][self.test['name']] = {'snapshots': []}
         ret = getattr(self, method)(node)
         assert ret is None
         self.k.info([node, 'leaving'])
@@ -1157,50 +1162,45 @@ def init_interpreter(file_, is_code=False):
     return Interpreter(ast)
 
 def run_tests(ast, tests):
-    results = []
-    for test_group in tests:
-        result_group = {}
-        for test_name in test_group:
-            result = result_group[test_name] = test_group[test_name].copy()
-            result['name'] = test_name
+    results = {}
+    for test in tests:
+        result = results[test] = tests[test].copy()
 
-            # TODO: can we just instantiate one of these?
-            interpreter = Interpreter(ast, result)
-            result['passed'] = False
-            try:
-                interpreter.setup_main(result['argv'].split(), None)
+        # TODO: can we just instantiate one of these?
+        result['passed'] = False
+        interpreter = Interpreter(ast, result)
+        try:
+            interpreter.setup_main(result['argv'].split(), None)
 
-                # we didn't encounter "PassedAllTestSteps", which means there are still expected
-                # test steps, so we failed
-                interpreter.get_test_step(None)
-            except PassedAllTestSteps:
-                result['passed'] = True
-            except InterpTooLong:
-                result['error'] = 'Infinite Loop?'
-                print('Infinite loop?')
-            except SegmentationFault:
-                result['error'] = 'Segmentation Fault'
-            except ExpectedStdin:
-                result['error'] = 'Expected Stdin'
-            except ExpectedStdout:
-                result['error'] = 'Expected Stdout'
-            except ExpectedStderr:
-                result['error'] = 'Expected Stderr'
-            except ExpectedReturn:
-                result['error'] = 'Expected Return'
-            except IncorrectStdout:
-                result['error'] = 'Incorrect stdout'
-            except IncorrectStderr:
-                result['error'] = 'Incorrect stderr'
-            except IncorrectReturn:
-                result['error'] = 'Incorrect return value'
-            except:
-                result['error'] = 'Internal error interpreting code'
+            # we didn't encounter "PassedAllTestSteps", which means there are still expected
+            # test steps, so we failed
+            interpreter.get_test_step(None)
+        except PassedAllTestSteps:
+            result['passed'] = True
+        except InterpTooLong:
+            result['error'] = 'Infinite Loop?'
+            print('Infinite loop?')
+        except SegmentationFault:
+            result['error'] = 'Segmentation Fault'
+        except ExpectedStdin:
+            result['error'] = 'Expected Stdin'
+        except ExpectedStdout:
+            result['error'] = 'Expected Stdout'
+        except ExpectedStderr:
+            result['error'] = 'Expected Stderr'
+        except ExpectedReturn:
+            result['error'] = 'Expected Return'
+        except IncorrectStdout:
+            result['error'] = 'Incorrect stdout'
+        except IncorrectStderr:
+            result['error'] = 'Incorrect stderr'
+        except IncorrectReturn:
+            result['error'] = 'Incorrect return value'
+        except:
+            result['error'] = 'Internal error interpreting code'
 
-            result['stdout'] = interpreter.stdout
-            result['stderr'] = interpreter.stderr
-            result['return'] = interpreter.ret_val
-
-        results.append(result_group)
+        result['stdout'] = interpreter.stdout
+        result['stderr'] = interpreter.stderr
+        result['return'] = interpreter.ret_val
 
     return results
