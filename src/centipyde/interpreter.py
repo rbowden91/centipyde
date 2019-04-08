@@ -222,8 +222,8 @@ class Interpreter(object):
         self.ast = ast
         self.k = InterpContinuation(self)
         self.rk = InterpContinuation(self)
-        self.old_changes = {}
 
+        self.node_changes = {}
         self.changes = {
             'scope': [[{}]],
             'stdout': '',
@@ -350,62 +350,7 @@ class Interpreter(object):
         while True:
             ret = self.step()
             if ret is not None:
-                if isinstance(ret[0], c_ast.Node):
-                    node = ret[0]
-                    if ret[1] == 'entering':
-                        #node.show(showcoord=True)
-
-                        #ret.show(showcoord=True)
-                        # TODO: do recursive calls work?
-                        if node not in self.old_changes:
-                            self.old_changes[node] = []
-                        self.old_changes[node].append(self.changes)
-                        new_changes = []
-                        for scope in self.changes['scope']:
-                            inner = []
-                            for i in range(len(scope)):
-                                inner.append({})
-                            new_changes.append(inner)
-                        self.changes = {
-                            'scope': new_changes,
-                            'memory': {},
-                            'filesystem': {},
-                            'stdout': '',
-                            'stderr': '',
-                            'return': False
-                        }
-                    else:
-                        assert ret[1] == 'leaving'
-                        # TODO check if before and after is same here?
-                        node.node_properties['test_data'][self.test['name']]['snapshots'].append(self.changes)
-                        old_changes = self.old_changes[node].pop()
-
-                        # merge changes
-                        old_changes['stdout'] += self.changes['stdout']
-                        old_changes['stderr'] += self.changes['stderr']
-                        old_changes['return'] = self.changes['return']
-                        for i in range(len(self.changes['scope'])):
-                            for j in range(len(self.changes['scope'][i])):
-                                old_scope = old_changes['scope'][i][j]
-                                new_scope = self.changes['scope'][i][j]
-                                for id_ in new_scope:
-                                    if id_ not in old_scope:
-                                        old_scope[id_] = { 'before': new_scope[id_]['before'] }
-                                    old_scope[id_]['after'] = new_scope[id_]['after']
-                                    if old_scope[id_]['before'] == old_scope[id_]['after']:
-                                        del(old_scope[id_])
-                        for base in self.changes['memory']:
-                            for offset in self.changes['memory'][base]:
-                                if base not in old_changes['memory']:
-                                    old_changes['memory'][base] = {}
-                                if offset not in old_changes['memory'][base]:
-                                    old_changes['memory'][base][offset] = { 'before': self.changes['memory'][base][offset]['before'] }
-                                old_changes['memory'][base][offset]['after'] = self.changes['memory'][base][offset]['after']
-                                if old_changes['memory'][base][offset]['before'] == old_changes['memory'][base][offset]['after']:
-                                    del(old_changes['memory'][base][offset])
-                        self.changes = old_changes
-                #else:
-                #    print(ret)
+                continue
             else:
                 break
 
@@ -598,13 +543,62 @@ class Interpreter(object):
 
     def visit(self, node):
         #print(node.__class__.__name__)
-        method = 'visit_' + node.__class__.__name__
         self.k.info([node, 'entering'])
-        if self.test['name'] not in node.node_properties['test_data']:
-            node.node_properties['test_data'][self.test['name']] = {'snapshots': []}
+        if node not in self.node_changes:
+            self.node_changes[node] = []
+        #node.show(showcoord=True)
+
+        #ret.show(showcoord=True)
+        # TODO: do recursive calls work?
+        self.node_changes[node].append(self.changes)
+        new_changes = []
+        for scope in self.changes['scope']:
+            inner = []
+            for i in range(len(scope)):
+                inner.append({})
+            new_changes.append(inner)
+        self.changes = {
+            'scope': new_changes,
+            'memory': {},
+            'filesystem': {},
+            'stdout': '',
+            'stderr': '',
+            'return': False
+        }
+
+        method = 'visit_' + node.__class__.__name__
         ret = getattr(self, method)(node)
         assert ret is None
         self.k.info([node, 'leaving'])
+
+        old_changes = self.node_changes[node].pop()
+        self.node_changes[node].append(self.changes)
+
+        # merge changes
+        old_changes['stdout'] += self.changes['stdout']
+        old_changes['stderr'] += self.changes['stderr']
+        old_changes['return'] = self.changes['return']
+        for i in range(len(self.changes['scope'])):
+            for j in range(len(self.changes['scope'][i])):
+                old_scope = old_changes['scope'][i][j]
+                new_scope = self.changes['scope'][i][j]
+                for id_ in new_scope:
+                    if id_ not in old_scope:
+                        old_scope[id_] = { 'before': new_scope[id_]['before'] }
+                    old_scope[id_]['after'] = new_scope[id_]['after']
+                    if old_scope[id_]['before'] == old_scope[id_]['after']:
+                        del(old_scope[id_])
+        for base in self.changes['memory']:
+            for offset in self.changes['memory'][base]:
+                if base not in old_changes['memory']:
+                    old_changes['memory'][base] = {}
+                if offset not in old_changes['memory'][base]:
+                    old_changes['memory'][base][offset] = { 'before': self.changes['memory'][base][offset]['before'] }
+                old_changes['memory'][base][offset]['after'] = self.changes['memory'][base][offset]['after']
+                if old_changes['memory'][base][offset]['before'] == old_changes['memory'][base][offset]['after']:
+                    del(old_changes['memory'][base][offset])
+        self.changes = old_changes
+
 
 
     def visit_ExpressionList(self, n):
@@ -1199,6 +1193,7 @@ def run_tests(ast, tests):
         except:
             result['error'] = 'Internal error interpreting code'
 
+        result['node_changes'] = interpreter.node_changes
         result['stdout'] = interpreter.stdout
         result['stderr'] = interpreter.stderr
         result['return'] = interpreter.ret_val
