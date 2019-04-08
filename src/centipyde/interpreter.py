@@ -540,25 +540,18 @@ class Interpreter(object):
 
         return self.ret_val
 
-
-    def visit(self, node):
-        #print(node.__class__.__name__)
-        self.k.info([node, 'entering'])
-        if node not in self.node_changes:
-            self.node_changes[node] = []
-        #node.show(showcoord=True)
-
-        #ret.show(showcoord=True)
+    def update_changes(self, node):
         # TODO: do recursive calls work?
         self.node_changes[node].append(self.changes)
-        new_changes = []
+
+        new_scope = []
         for scope in self.changes['scope']:
             inner = []
             for i in range(len(scope)):
                 inner.append({})
-            new_changes.append(inner)
+            new_scope.append(inner)
         self.changes = {
-            'scope': new_changes,
+            'scope': new_scope,
             'memory': {},
             'filesystem': {},
             'stdout': '',
@@ -566,15 +559,11 @@ class Interpreter(object):
             'return': False
         }
 
-        method = 'visit_' + node.__class__.__name__
-        ret = getattr(self, method)(node)
-        assert ret is None
-        self.k.info([node, 'leaving'])
-
+    def merge_changes(self, node):
         old_changes = self.node_changes[node].pop()
         self.node_changes[node].append(self.changes)
 
-        # merge changes
+        ## merge changes
         old_changes['stdout'] += self.changes['stdout']
         old_changes['stderr'] += self.changes['stderr']
         old_changes['return'] = self.changes['return']
@@ -586,8 +575,8 @@ class Interpreter(object):
                     if id_ not in old_scope:
                         old_scope[id_] = { 'before': new_scope[id_]['before'] }
                     old_scope[id_]['after'] = new_scope[id_]['after']
-                    if old_scope[id_]['before'] == old_scope[id_]['after']:
-                        del(old_scope[id_])
+                    #if old_scope[id_]['before'] == old_scope[id_]['after']:
+                    #    del(old_scope[id_])
         for base in self.changes['memory']:
             for offset in self.changes['memory'][base]:
                 if base not in old_changes['memory']:
@@ -598,6 +587,21 @@ class Interpreter(object):
                 if old_changes['memory'][base][offset]['before'] == old_changes['memory'][base][offset]['after']:
                     del(old_changes['memory'][base][offset])
         self.changes = old_changes
+
+
+    def visit(self, node):
+        if node not in self.node_changes:
+            self.node_changes[node] = []
+
+        #print(node.__class__.__name__)
+        self.k.info([node, 'entering']).apply(lambda:self.update_changes(node))
+
+        method = 'visit_' + node.__class__.__name__
+        ret = getattr(self, method)(node)
+        assert ret is None
+        self.k.apply(lambda:self.merge_changes(node)).info([node, 'leaving'])
+
+
 
 
 
