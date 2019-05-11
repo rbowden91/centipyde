@@ -349,14 +349,12 @@ class Interpreter(object):
         num_steps = 0
         while True:
             ret = self.step()
-            if ret is not None:
-                continue
-            else:
+            if ret is None:
                 break
-
             num_steps += 1
             if num_steps >= self.max_steps:
                 raise InterpTooLong()
+
 
 
     def make_val(self, type_, val):
