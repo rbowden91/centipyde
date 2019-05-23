@@ -6,6 +6,7 @@ import inspect
 import operator
 import subprocess
 import copy
+import traceback
 from contextlib import contextmanager
 from pycparser import c_ast, c_parser # type:ignore
 
@@ -225,6 +226,7 @@ class Interpreter(object):
 
         self.node_changes = {}
         self.changes = {
+            # TODO: reading from stdin is also an environment change...
             'scope': [[{}]],
             'stdout': '',
             'stderr': '',
@@ -332,7 +334,7 @@ class Interpreter(object):
 
     def put_stderr(self, stderr):
         if self.test is not None:
-            self.get_test_step('stderr', stdout)
+            self.get_test_step('stderr', stderr)
         else:
             self.stderr += stderr
 
@@ -345,7 +347,7 @@ class Interpreter(object):
     def step(self):
         return self.k.step()
 
-    def run(self):
+    def run(self, until=None):
         num_steps = 0
         while True:
             ret = self.step()
@@ -354,6 +356,9 @@ class Interpreter(object):
             num_steps += 1
             if num_steps >= self.max_steps:
                 raise InterpTooLong()
+            # TODO: we don't want to reset "num_steps" if we break here...
+            if until is not None and ret == until:
+                break
 
 
 
@@ -416,7 +421,8 @@ class Interpreter(object):
 
         if id_ not in self.changes['scope'][-1][scope]:
             self.changes['scope'][-1][scope][id_] = {
-                'before': self.scope[-1][scope][id_].value if id_ in self.scope[-1][scope] else None
+                'before': self.scope[-1][scope][id_].value if id_ in self.scope[-1][scope] and
+                    self.scope[-1][scope][id_] is not None else None
             }
         if isinstance(self.changes['scope'][-1][scope][id_]['before'], Address):
             self.changes['scope'][-1][scope][id_]['before'] = (
@@ -572,15 +578,17 @@ class Interpreter(object):
                 for id_ in new_scope:
                     if id_ not in old_scope:
                         old_scope[id_] = { 'before': new_scope[id_]['before'] }
-                    old_scope[id_]['after'] = new_scope[id_]['after']
-                    #if old_scope[id_]['before'] == old_scope[id_]['after']:
-                    #    del(old_scope[id_])
+                    if 'after' in new_scope[id_]:
+                        old_scope[id_]['after'] = new_scope[id_]['after']
+                        #if old_scope[id_]['before'] == old_scope[id_]['after']:
+                        #    del(old_scope[id_])
         for base in self.changes['memory']:
             for offset in self.changes['memory'][base]:
                 if base not in old_changes['memory']:
                     old_changes['memory'][base] = {}
                 if offset not in old_changes['memory'][base]:
                     old_changes['memory'][base][offset] = { 'before': self.changes['memory'][base][offset]['before'] }
+                # TODO: also add in the notion of "read" here
                 old_changes['memory'][base][offset]['after'] = self.changes['memory'][base][offset]['after']
                 if old_changes['memory'][base][offset]['before'] == old_changes['memory'][base][offset]['after']:
                     del(old_changes['memory'][base][offset])
@@ -607,9 +615,28 @@ class Interpreter(object):
         self.stmt_helper(n.expressions, False)
 
     def visit_NodeWrapper(self, n):
-        if n.new is not None:
+        if isinstance(n.old, c_ast.Decl):
+            # TODO: fail if this has already been declared in this scope?
+            # TODO: could grab type from the decl, too?
+            (self.k.visit(n.old.type).expect(lambda type_:
+                self.k.apply(lambda: operator.setitem(self.scope[-1][-1], n.old.name, self.make_val(type_, None)))))
+
+        if n.do_interpret:
+            self.k.visit(n.old)
+        elif n.new is not None:
             self.k.visit(n.new)
         else:
+            self.k.passthrough(lambda: Flow('Normal'))
+
+    def visit_BreakPoint(self, n):
+        (self.k
+        .apply(lambda: n.pre(self)))
+        if n.child is not None:
+            (self.k
+            .visit(n.child)
+            .apply(lambda: n.post(self)))
+        else:
+            # TODO: is this right?
             self.k.passthrough(lambda: Flow('Normal'))
 
     def visit_ArrayRef(self, n):
@@ -832,6 +859,14 @@ class Interpreter(object):
         .loop(lambda expr: self.k.visit(expr)))
 
     def visit_ID(self, n):
+        def get_scope(scope, id_):
+            if id_ not in self.changes['scope'][-1][scope]:
+                self.changes['scope'][-1][scope][id_] = {}
+            if 'before' not in self.changes['scope'][-1][scope][id_]:
+                self.changes['scope'][-1][scope][id_]['before'] = self.scope[-1][scope][id_]
+
+            return self.scope[-1][scope][id_]
+
         def helper():
             for i in range(len(self.scope[-1])-1, -1, -1):
                 if n.name in self.scope[-1][i]:
@@ -850,7 +885,7 @@ class Interpreter(object):
                 .passthrough(lambda: lambda val: self.update_scope(n.name, val, scope)))
             .else_(lambda: self.k
                 .kassert(lambda: self.scope[-1][scope][n.name].value is not None, "Uninitialized variable" + n.name)
-                .passthrough(lambda: self.scope[-1][scope][n.name]))))
+                .passthrough(lambda: get_scope(scope, n.name)))))
 
     def visit_FileAST(self, n):
         # TODO: put global map placement in here??
@@ -1194,10 +1229,11 @@ def run_tests(ast, tests):
             result['error'] = 'Incorrect return value'
         except:
             result['error'] = 'Internal error interpreting code'
+            traceback.print_exc()
 
-        result['node_changes'] = interpreter.node_changes
         result['stdout'] = interpreter.stdout
         result['stderr'] = interpreter.stderr
         result['return'] = interpreter.ret_val
+        result['node_changes'] = interpreter.node_changes
 
     return results
